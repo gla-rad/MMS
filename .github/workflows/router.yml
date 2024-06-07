@@ -38,5 +38,5 @@ jobs:
         uses: docker/build-push-action@v3
         with:
           file: docker/Dockerfile.router
-          tags: ghcr.io/gla-rad/mc-mms-edgerouter
+          tags: ghcr.io/gla-rad/mc-mms-router
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
