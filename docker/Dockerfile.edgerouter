@@ -64,7 +64,6 @@ EXPOSE 9000
 ENV MRN="urn:mrn:mcp:device:idp1:org1:er"
 ENV RADDR="ws://localhost:8080"
 ENV PORT="8080"
-ENV LIBP2P_PORT="9000"
 ENV PRIVKEY=""
 ENV CLIENT_CERT_PATH=""
 ENV CLIENT_CERT_KEY_PATH=""
@@ -73,4 +72,4 @@ ENV CERT_KEY_PATH=""
 ENV CLIENT_CA=""
 
 # Command to run the executable with environment variables as input parameters
-CMD ["sh", "-c", "./edgerouter --mrn $MRN --raddr $RADDR --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cilent-cert $CLIENT_CERT_PATH --cilent-cert-key $CLIENT_CERT_KEY_PATH --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
+CMD ["sh", "-c", "./edgerouter --mrn $MRN --raddr $RADDR --port $PORT --privkey $PRIVKEY --cilent-cert $CLIENT_CERT_PATH --cilent-cert-key $CLIENT_CERT_KEY_PATH --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
