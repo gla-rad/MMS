@@ -63,4 +63,4 @@ ENV CERT_KEY_PATH="default_cert_key_path"
 ENV CLIENT_CA="default_client_ca"
 
 # Command to run the executable with environment variables as input parameters
-CMD ["sh", "-c", "./router --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
+CMD ["sh", "-c", "/router/router --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
