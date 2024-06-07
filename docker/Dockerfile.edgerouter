@@ -51,7 +51,7 @@ FROM debian:bookworm
 # Set the Current Working Directory inside the container
 WORKDIR /edgerouter
 
-RUN apt-get update && apt-get install -y ca-certificate
+RUN apt-get update && apt-get install -y ca-certificates
 
 # Copy the Pre-built binary file from the previous stage
 COPY --from=builder /edgerouter/edgerouter .
