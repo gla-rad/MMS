@@ -46,12 +46,12 @@ COPY ./consumer/ /consumer/
 RUN go build -o edgerouter .
 
 # Start a new stage from scratch
-FROM alpine:latest
+FROM debian:bookworm
 
 # Set the Current Working Directory inside the container
 WORKDIR /edgerouter
 
-RUN apk update && apk add -q ca-certificates
+RUN apt-get update && apt-get install -y ca-certificate
 
 # Copy the Pre-built binary file from the previous stage
 COPY --from=builder /edgerouter/edgerouter .
@@ -73,4 +73,4 @@ ENV CERT_KEY_PATH=""
 ENV CLIENT_CA=""
 
 # Command to run the executable with environment variables as input parameters
-CMD ["sh", "-c", "/edgerouter/edgerouter --mrn $MRN --raddr $RADDR --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cilent-cert $CLIENT_CERT_PATH --cilent-cert-key $CLIENT_CERT_KEY_PATH --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
+CMD ["sh", "-c", "./edgerouter --mrn $MRN --raddr $RADDR --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cilent-cert $CLIENT_CERT_PATH --cilent-cert-key $CLIENT_CERT_KEY_PATH --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]

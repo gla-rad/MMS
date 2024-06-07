@@ -42,7 +42,7 @@ COPY ./consumer/ ../consumer/
 RUN go build -o router .
 
 # Start a new stage from scratch
-FROM alpine:latest
+FROM debian:bookworm
 
 # Set the Current Working Directory inside the container
 WORKDIR /router
@@ -57,10 +57,11 @@ EXPOSE 9000
 # Set default environment variables
 ENV PORT="8080"
 ENV LIBP2P_PORT="9000"
-ENV PRIVKEY="default_privkey_value"
-ENV CERT_PATH="default_cert_path"
-ENV CERT_KEY_PATH="default_cert_key_path"
-ENV CLIENT_CA="default_client_ca"
+ENV PRIVKEY=""
+ENV CERT_PATH=""
+ENV CERT_KEY_PATH=""
+ENV CLIENT_CA=""
 
 # Command to run the executable with environment variables as input parameters
-CMD ["sh", "-c", "/router/router --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
+CMD ["sh", "-c", "./router --port $PORT --libp2p-port $LIBP2P_PORT --privkey $PRIVKEY --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
+
