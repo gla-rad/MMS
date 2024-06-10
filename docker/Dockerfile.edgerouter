@@ -1,7 +1,7 @@
 # Build like this:
 #     docker build -t <version> -f Dockerfile ..
 # e.g.
-#     docker build -t glarad/mc-mms-edgerouter:latest -f Dockerfile ..
+#     docker build -t glarad/mc-mms-edgerouter:latest -f Dockerfile.edgerouter ..
 #
 # Run like this:
 #     sudo docker run -t -i --rm -p 8080:8080 -p 9000:9000 -v /path/to/config-directory/on/machine:/conf 
@@ -56,6 +56,12 @@ RUN apt-get update && apt-get install -y ca-certificates
 # Copy the Pre-built binary file from the previous stage
 COPY --from=builder /edgerouter/edgerouter .
 
+# Copy the entrypoint script to the image
+COPY ./edgerouter/entrypoint.sh /edgerouter/
+
+# Ensure the entrypoint script is executable
+RUN chmod +x /edgerouter/entrypoint.sh
+
 # Expose ports
 EXPOSE 8080
 EXPOSE 9000
@@ -70,5 +76,5 @@ ENV CERT_PATH=""
 ENV CERT_KEY_PATH=""
 ENV CLIENT_CA=""
 
-# Command to run the executable with environment variables as input parameters
-CMD ["sh", "-c", "./edgerouter --mrn $MRN --raddr $RADDR --port $PORT --client-cert $CLIENT_CERT_PATH --client-cert-key $CLIENT_CERT_KEY_PATH --cert-path $CERT_PATH --cert-key-path $CERT_KEY_PATH --client-ca $CLIENT_CA"]
+# Set the entrypoint to the script
+ENTRYPOINT ["/edgerouter/entrypoint.sh"]
