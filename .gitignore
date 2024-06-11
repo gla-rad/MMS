@@ -70,3 +70,5 @@ fabric.properties
 # Go workspace file
 go.work
 
+# The config diretory
+config
