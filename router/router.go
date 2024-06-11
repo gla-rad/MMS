@@ -818,7 +818,7 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 	// TODO make the router discover its public IP address so it can be published
 
 	beacons := make([]peerstore.AddrInfo, 0, 1)
-	beaconsFile, err := os.Open("beacons.txt")
+	beaconsFile, err := os.Open("/conf/beacons.txt")
 	if err == nil {
 		fileScanner := bufio.NewScanner(beaconsFile)
 		for fileScanner.Scan() {
