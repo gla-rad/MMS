@@ -9,7 +9,6 @@
 #       -e RADDR="custom_raddr_value" \
 #       -e PORT="8080" \
 #       -e LIBP2P_PORT="9000" \
-#       -e PRIVKEY="custom_privkey_value" \
 #       -e CLIENT_CERT_PATH="custom_client_cert_path" \
 #       -e CLIENT_CERT_KEY_PATH="custom_client_cert_key_path" \
 #       -e CERT_PATH="custom_cert_path" \

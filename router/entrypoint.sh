@@ -15,7 +15,7 @@ fi
 
 # Check if PRIVKEY is set and non-empty
 if [ ! -z "$PRIVKEY" ]; then
-  CMD="$CMD --privkey $PRIVKEYPORT"
+  CMD="$CMD --privkey $PRIVKEY"
 fi
 
 # Check if CERT_PATH is set and non-empty
