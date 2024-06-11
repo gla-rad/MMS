@@ -1054,7 +1054,7 @@ func main() {
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				Certificates: certificates,
-				InsecureSkipVerify: true
+				InsecureSkipVerify: true,
 			},
 		},
 	}
