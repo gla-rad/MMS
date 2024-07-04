@@ -1,7 +1,7 @@
 # Build like this:
 #     docker build -t <version> -f Dockerfile ..
 # e.g.
-#     docker build -t glarad/mc-mms-edgerouter:latest -f Dockerfile.router ..
+#     docker build -t glarad/mc-mms-router:latest -f Dockerfile.router ..\
 #
 # Run like this:
 #     sudo docker run -t -i --rm -p 8080:8080 -p 9000:9000 -v /path/to/config-directory/on/machine:/conf 
@@ -67,6 +67,7 @@ ENV PRIVKEY=""
 ENV CERT_PATH=""
 ENV CERT_KEY_PATH=""
 ENV CLIENT_CA=""
+ENV BEACONS="/conf/beacons.txt"
 
 # Set the entrypoint to the script
 ENTRYPOINT ["/router/entrypoint.sh"]

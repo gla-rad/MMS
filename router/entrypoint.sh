@@ -33,5 +33,10 @@ if [ ! -z "$CLIENT_CA" ]; then
   CMD="$CMD --client-ca $CLIENT_CA"
 fi
 
+# Check if BEACONS is set and non-empty
+if [ ! -z "$BEACONS" ]; then
+  CMD="$CMD --beacons $BEACONS"
+fi
+
 # Execute the constructed command
 exec $CMD
