@@ -18,13 +18,18 @@ package rw
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/coder/websocket"
 	"github.com/maritimeconnectivity/MMS/mmtp"
 	"google.golang.org/protobuf/proto"
-	"nhooyr.io/websocket"
 )
 
 func WriteMessage(ctx context.Context, c *websocket.Conn, mmtpMessage *mmtp.MmtpMessage) error {
+	if c == nil {
+		return errors.New("No websocket connection")
+	}
 	b, err := proto.Marshal(mmtpMessage)
 	if err != nil {
 		return fmt.Errorf("could not marshal message: %w", err)

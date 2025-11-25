@@ -23,7 +23,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/charmbracelet/log"
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/libp2p/zeroconf/v2"
 	"github.com/maritimeconnectivity/MMS/consumer"
@@ -32,22 +44,16 @@ import (
 	"github.com/maritimeconnectivity/MMS/utils/errMsg"
 	"github.com/maritimeconnectivity/MMS/utils/revocation"
 	"github.com/maritimeconnectivity/MMS/utils/rw"
-	"net/http"
-	"nhooyr.io/websocket"
-	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
-	WsReadLimit      int64         = 1 << 20             // 1 MiB = 1048576 B
-	MessageSizeLimit int           = 50 * (1 << 10)      // 50 KiB = 51200 B
-	ExpirationLimit  time.Duration = time.Hour * 24 * 30 // 30 days
-	ChannelBufSize   int           = 1048576
+	WsReadLimit      int64 = -1                  // 1 MiB = 1048576 B
+	MessageSizeLimit int   = 50 * (1 << 10)      // 50 KiB = 51200 B
+	ExpirationLimit        = time.Hour * 24 * 30 // 30 days
+	ChannelBufSize   int   = 1048576
 )
 
 // Agent type representing a connected Edge Router
@@ -102,9 +108,10 @@ type EdgeRouter struct {
 	routerAddr      *string                      // Address of initial router to connect to, if provided
 	httpClient      *http.Client                 // The EdgeRouters http client if provided
 	wsMu            *sync.RWMutex                // Mutex for locking the WS upon send/recv, to properly handle if socket was closed
+	geoLocation     string                       //Lookup code for the actual position of the running instance
 }
 
-func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.MmtpMessage, routerWs *websocket.Conn, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, routerAddr *string, httpClient *http.Client) (*EdgeRouter, error) {
+func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.MmtpMessage, routerWs *websocket.Conn, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, routerAddr *string, httpClient *http.Client, geoLoc string) (*EdgeRouter, error) {
 	subs := make(map[string]*Subscription)
 	subMu := &sync.RWMutex{}
 	agents := make(map[string]*Agent)
@@ -154,10 +161,13 @@ func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.
 		routerAddr:      routerAddr,
 		httpClient:      httpClient,
 		wsMu:            wsMu,
+		geoLocation:     geoLoc,
 	}, nil
 }
 
-func (er *EdgeRouter) connectMMTPToRouter(ctx context.Context, wg *sync.WaitGroup) error {
+func (er *EdgeRouter) connectMMTPToRouter(ctx context.Context) error {
+	log.Debugf("Own mrn is %v", er.ownMrn)
+
 	connect := &mmtp.MmtpMessage{
 		MsgType: mmtp.MsgType_PROTOCOL_MESSAGE,
 		Uuid:    uuid.NewString(),
@@ -187,9 +197,6 @@ func (er *EdgeRouter) connectMMTPToRouter(ctx context.Context, wg *sync.WaitGrou
 		return fmt.Errorf("the MMS Router did not accept Connect: %s", connectResp.GetReasonText())
 	}
 
-	wg.Add(2)
-	go handleIncomingMessages(ctx, er, wg)
-	go handleOutgoingMessages(ctx, er, wg)
 	return nil
 }
 
@@ -203,7 +210,7 @@ func (er *EdgeRouter) StartEdgeRouter(ctx context.Context, wg *sync.WaitGroup, c
 
 	// TODO store reconnect token and handle reconnection in case of disconnect
 	if er.routerWs != nil {
-		err := er.connectMMTPToRouter(ctx, wg)
+		err := er.connectMMTPToRouter(ctx)
 		if err != nil {
 			log.Error(err)
 		}
@@ -213,7 +220,14 @@ func (er *EdgeRouter) StartEdgeRouter(ctx context.Context, wg *sync.WaitGroup, c
 	go func() {
 		log.Infof("Websocket listening on %s", er.httpServer.Addr)
 		if *certPath != "" && *certKeyPath != "" {
-			if err := er.httpServer.ListenAndServeTLS(*certPath, *certKeyPath); err != nil {
+			er.httpServer.TLSConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				cert, err := tls.LoadX509KeyPair(*certPath, *certKeyPath)
+				if err != nil {
+					return nil, err
+				}
+				return &cert, nil
+			}
+			if err := er.httpServer.ListenAndServeTLS("", ""); err != nil {
 				log.Warn(err)
 			}
 		} else {
@@ -225,6 +239,11 @@ func (er *EdgeRouter) StartEdgeRouter(ctx context.Context, wg *sync.WaitGroup, c
 	}()
 
 	go er.messageGC(ctx, wg)
+
+	wg.Add(2)
+	log.Debug("Spawning message threads")
+	go handleIncomingMessages(ctx, er, wg)
+	go handleOutgoingMessages(ctx, er, wg)
 
 	<-ctx.Done()
 	log.Warn("Shutting down Edge Router")
@@ -260,7 +279,7 @@ func (er *EdgeRouter) StartEdgeRouter(ctx context.Context, wg *sync.WaitGroup, c
 	}
 }
 
-func (er *EdgeRouter) TryConnectRouter(ctx context.Context, wg *sync.WaitGroup) {
+func (er *EdgeRouter) TryConnectRouter(ctx context.Context) {
 	if er.routerWs != nil {
 		wsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -269,20 +288,30 @@ func (er *EdgeRouter) TryConnectRouter(ctx context.Context, wg *sync.WaitGroup) 
 			return
 		}
 	}
+	if er.routerWs != nil {
+		if err := er.routerWs.CloseNow(); err != nil {
+			log.Warn(err)
+		}
+	}
+
+	//Make sure old connection is completely cleaned up
+
 	//Runs until a router has been found
 	log.Info("Probing for a router connection")
 	for {
+		log.Debugf("Attempt connect to %v", *er.routerAddr)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(5 * time.Second):
 			routerWs, _, err := websocket.Dial(ctx, *er.routerAddr, &websocket.DialOptions{HTTPClient: er.httpClient, CompressionMode: websocket.CompressionContextTakeover})
 			if err != nil {
+				log.Debugf("Could not connect to router: %v", err)
 				continue
 			}
 			er.routerWs = routerWs
 			er.routerWs.SetReadLimit(WsReadLimit)
-			err = er.connectMMTPToRouter(ctx, wg)
+			err = er.connectMMTPToRouter(ctx)
 			if err != nil {
 				log.Error(err)
 			}
@@ -295,7 +324,7 @@ func (er *EdgeRouter) TryConnectRouter(ctx context.Context, wg *sync.WaitGroup) 
 // TryConnectRouterRoutine is a wrapper function called when starting TryConnectRouter in a new thread
 func (er *EdgeRouter) TryConnectRouterRoutine(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	er.TryConnectRouter(ctx, wg)
+	er.TryConnectRouter(ctx)
 }
 
 // Function for garbage collection of expired messages
@@ -307,7 +336,7 @@ func (er *EdgeRouter) messageGC(ctx context.Context, wg *sync.WaitGroup) {
 			return
 		case <-time.After(5 * time.Minute): // run every 5 minutes
 			er.agentsMu.RLock()
-			now := time.Now().UnixMilli()
+			now := time.Now().Unix()
 			for _, a := range er.agents {
 				a.MsgMu.Lock()
 				for _, m := range a.Messages {
@@ -357,7 +386,7 @@ func (er *EdgeRouter) handleNotify(metadata []*mmtp.MessageMetadata) error {
 func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[string]*Subscription, subMu *sync.RWMutex, agents map[string]*Agent, agentsMu *sync.RWMutex, mrnToAgent map[string]*Agent, mrnToAgentMu *sync.RWMutex, ctx context.Context, wg *sync.WaitGroup) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		wg.Add(1)
-		c, err := websocket.Accept(writer, request, &websocket.AcceptOptions{OriginPatterns: []string{"*"}, CompressionMode: websocket.CompressionContextTakeover})
+		c, err := websocket.Accept(writer, request, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
 		if err != nil {
 			log.Error("Could not establish websocket connection", err)
 			wg.Done()
@@ -365,9 +394,10 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 		}
 		defer func(c *websocket.Conn, code websocket.StatusCode, reason string) {
 			err := c.Close(code, reason)
-			if err != nil {
+			if err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Errorf("Could not close connection: %s", err.Error())
 			}
+
 			wg.Done()
 		}(c, websocket.StatusInternalError, "PANIC!!!")
 
@@ -410,9 +440,6 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 			var mrnErr *auth.MrnMismatchErr
 			switch {
 			case errors.As(err, &certErr):
-				if wsErr := c.Close(websocket.StatusPolicyViolation, err.Error()); wsErr != nil {
-					log.Error(wsErr)
-				}
 			case errors.As(err, &sigAlgErr):
 				if wsErr := c.Close(websocket.StatusPolicyViolation, err.Error()); wsErr != nil {
 					log.Error(wsErr)
@@ -546,8 +573,18 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 						}
 					case mmtp.ProtocolMessageType_DISCONNECT_MESSAGE:
 						{
+							log.Info("Disconnect")
 							if err = agent.HandleDisconnect(mmtpMessage, request, c); err != nil {
 								log.Error("Failed handling Disconnect message:", err)
+							} else {
+								//Sucess, remove agent from edgerouters map of agents and list of reconnecttokens
+								mrnToAgentMu.Lock()
+								delete(mrnToAgent, agent.Mrn)
+								mrnToAgentMu.Unlock()
+
+								agentsMu.Lock()
+								delete(agents, agent.ReconnectToken)
+								agentsMu.Unlock()
 							}
 							return
 						}
@@ -798,7 +835,6 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 			errMsg.SendErrorMessage(mmtpMessage.GetUuid(), "Subject string may not exceed 100 characters", request.Context(), c)
 			return
 		}
-
 		outgoingChannel <- mmtpMessage
 		header := send.GetApplicationMessage().GetHeader()
 		if len(header.GetRecipients().GetRecipients()) > 0 {
@@ -825,6 +861,18 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 				}
 			}
 			subMu.RUnlock()
+		}
+		resp := &mmtp.MmtpMessage{
+			MsgType: mmtp.MsgType_RESPONSE_MESSAGE,
+			Uuid:    uuid.NewString(),
+			Body: &mmtp.MmtpMessage_ResponseMessage{
+				ResponseMessage: &mmtp.ResponseMessage{
+					ResponseToUuid: mmtpMessage.GetUuid(),
+					Response:       mmtp.ResponseEnum_GOOD,
+				}},
+		}
+		if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
+			log.Error("Could not send Send OK response:", err)
 		}
 	}
 }
@@ -869,15 +917,15 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 			if err != nil {
 				log.Warn("Could not receive response from MMS Router:", err)
 				edgeRouter.wsMu.Lock()
-				edgeRouter.TryConnectRouter(ctx, wg)
+				edgeRouter.TryConnectRouter(ctx)
 				edgeRouter.wsMu.Unlock()
+				continue
 			}
 
 			if _, err := uuid.Parse(response.GetUuid()); err != nil {
 				// message UUID is invalid, so we discard it
 				continue
 			}
-
 			switch response.GetBody().(type) {
 			case *mmtp.MmtpMessage_ResponseMessage:
 				{
@@ -899,10 +947,11 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 					}
 
 					now := time.Now()
-					nowMilli := now.UnixMilli()
-					for _, appMsg := range responseMsg.GetApplicationMessages() {
+					nowSeconds := now.Unix()
+					for _, msgContent := range responseMsg.GetMessageContent() {
+						appMsg := msgContent.GetMsg()
 						msgExpires := appMsg.GetHeader().GetExpires()
-						if appMsg == nil || nowMilli > msgExpires || msgExpires > now.Add(ExpirationLimit).UnixMilli() {
+						if appMsg == nil || nowSeconds > msgExpires || msgExpires > now.Add(ExpirationLimit).Unix() {
 							// message is nil, expired or has a too long expiration, so we discard it
 							continue
 						}
@@ -938,7 +987,7 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 								for _, recipient := range subjectOrRecipient.Recipients.GetRecipients() {
 									log.Debugf("recipient %s, hex: %x", recipient, recipient)
 									agent, ok := edgeRouter.mrnToAgent[recipient]
-									log.Debugf("agent: %s, ok: %b", agent, ok)
+									log.Debugf("agent: %v, ok: %t", agent, ok)
 									if ok && agent.directMessages {
 										err = agent.QueueMessage(incomingMessage)
 										if err != nil {
@@ -990,7 +1039,7 @@ func handleOutgoingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 							log.Warn("Could not send outgoing message to MMS Router, will try again later:", err)
 							edgeRouter.outgoingChannel <- outgoingMessage
 							edgeRouter.wsMu.Lock()
-							edgeRouter.TryConnectRouter(ctx, wg)
+							edgeRouter.TryConnectRouter(ctx)
 							edgeRouter.wsMu.Unlock()
 							continue
 						}
@@ -1012,6 +1061,107 @@ func handleOutgoingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 	}
 }
 
+func recordMetrics(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry, er *EdgeRouter) {
+	defer wg.Done()
+	connAgents := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "edgerouter_num_connected_agents",
+		Help: "The total number of agents connected to the edgerouter",
+	})
+	rcTokens := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "edgerouter_num_agent_stored_reconnectTokens",
+		Help: "The total number of stored reconnectTokens",
+	})
+	memAlloc := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "edgerouter_heap_mem_alloc",
+		Help: "The amount of heap allocated memory in KB",
+	})
+
+	geo := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "loc_export",                                // Name of the metric
+			Help: "A metric to store geo-location as a label", // Description of the metric
+		},
+		[]string{"lookup"}, // Define the label key (in this case "location")
+	)
+
+	geoDataFlow := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "loc_export2",                                       // Name of the metric
+			Help: "A metric mapping geo_Location and active dataflow", // Description of the metric
+		},
+		[]string{"lookup2"}, // Define the label key (in this case "location")
+	)
+
+	numConnClientsFlow := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "loc_export3",                                                // Name of the metric
+			Help: "A metric mapping geo_Location and number of clients served", // Description of the metric
+		},
+		[]string{"lookup3"}, // Define the label key (in this case "location")
+	)
+
+	reg.MustRegister(connAgents)
+	reg.MustRegister(rcTokens)
+	reg.MustRegister(memAlloc)
+	if er.geoLocation != "" {
+		reg.MustRegister(geo)
+		reg.MustRegister(geoDataFlow)
+		reg.MustRegister(numConnClientsFlow)
+	} else {
+		log.Warn("Geolocation not set")
+	}
+	geo.With(prometheus.Labels{"lookup": er.geoLocation}).Set(1)
+
+	var m runtime.MemStats
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+			er.agentsMu.Lock()
+			rcTokens.Set(float64(len(er.agents)))
+			er.agentsMu.Unlock()
+
+			runtime.ReadMemStats(&m)
+			memAlloc.Set(float64(m.Alloc / 1024))
+			geoDataFlow.With(prometheus.Labels{"lookup2": er.geoLocation}).Set(float64(m.Alloc / 1024))
+
+			er.mrnToAgentMu.Lock()
+			connAgents.Set(float64(len(er.mrnToAgent)))
+			numConnClientsFlow.With(prometheus.Labels{"lookup3": er.geoLocation}).Set(float64(len(er.mrnToAgent)))
+			er.mrnToAgentMu.Unlock()
+		}
+	}
+}
+
+func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry) {
+	defer wg.Done()
+
+	// Start the Prometheus metrics server
+	server := &http.Server{
+		Addr:    ":2112",
+		Handler: http.DefaultServeMux,
+	}
+
+	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Errorf("ListenAndServe(): %s", err)
+		}
+	}()
+
+	// Listen for context cancellation to gracefully shutdown the server
+	<-ctx.Done()
+	log.Warn("Shutting down Prometheus server...")
+
+	if err := server.Shutdown(context.Background()); err != nil {
+		log.Errorf("Server Shutdown: %s", err)
+	}
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1028,6 +1178,8 @@ func main() {
 	certKeyPath := flag.String("cert-key-path", "", "Path to a TLS certificate private key. If none is provided, TLS will be disabled.")
 	clientCAs := flag.String("client-ca", "", "Path to a file containing a list of client CAs that can connect to this Edge Router.")
 	debug := flag.Bool("d", false, "Indicates whether debugging should be enabled, false by default")
+	geoLoc := flag.String("l", "", "Lookup code indicating the geo location of the running instance")
+	insecure := flag.Bool("i", false, "Allow insecure TLS (No validation of certificate CA)")
 
 	flag.Parse()
 	if *debug {
@@ -1039,24 +1191,36 @@ func main() {
 
 	outgoingChannel := make(chan *mmtp.MmtpMessage, ChannelBufSize)
 
-	certificates := make([]tls.Certificate, 0, 1)
+	var clientCertFunc func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
 
 	if *clientCertPath != "" && *clientCertKeyPath != "" {
-		cert, err := tls.LoadX509KeyPair(*clientCertPath, *clientCertKeyPath)
-		if err != nil {
-			log.Error("Could not read the provided client certificate:", err)
-			return
+		clientCertFunc = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			cert, err := tls.LoadX509KeyPair(*clientCertPath, *clientCertKeyPath)
+			if err != nil {
+				log.Error("Could not read the provided client certificate:", err)
+				return nil, err
+			}
+			parsedCert, err := x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				log.Error("Could not parse the provided client certificate:", err)
+				*ownMrn = auth.GetMrnFromCertificate(parsedCert)
+			}
+			return &cert, nil
 		}
-		certificates = append(certificates, cert)
 	}
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				Certificates: certificates,
-				InsecureSkipVerify: true,
+				GetClientCertificate: clientCertFunc,
 			},
 		},
+	}
+
+	if *insecure {
+		log.Warn("Insecure TLS Allowed for this Session")
+		transport := httpClient.Transport.(*http.Transport)
+		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 
 	routerWs, _, err := websocket.Dial(ctx, *routerAddr, &websocket.DialOptions{HTTPClient: httpClient, CompressionMode: websocket.CompressionContextTakeover})
@@ -1070,20 +1234,20 @@ func main() {
 
 	wg := &sync.WaitGroup{}
 
-	er, err := NewEdgeRouter(":"+strconv.Itoa(*listeningPort), *ownMrn, outgoingChannel, routerWs, ctx, wg, clientCAs, routerAddr, httpClient)
+	er, err := NewEdgeRouter(":"+strconv.Itoa(*listeningPort), *ownMrn, outgoingChannel, routerWs, ctx, wg, clientCAs, routerAddr, httpClient, *geoLoc)
 	if err != nil {
 		log.Error("Could not create MMS Edge Router instance:", err)
 		return
 	}
 
-	//Start thread to probe for a router connection, but only if a routerAddr was given
-	if routerWs == nil && routerAddr != nil {
-		wg.Add(1)
-		go er.TryConnectRouterRoutine(ctx, wg)
-	}
-
 	wg.Add(1)
 	go er.StartEdgeRouter(ctx, wg, certPath, certKeyPath)
+
+	//Start monitoring
+	wg.Add(2)
+	reg := prometheus.NewRegistry()
+	go recordMetrics(ctx, wg, reg, er)
+	go runPrometheusMetricsServer(ctx, wg, reg)
 
 	mdnsServer, err := zeroconf.Register("MMS Edge Router", "_mms-edgerouter._tcp", "local.", *listeningPort, nil, nil)
 	if err != nil {

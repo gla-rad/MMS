@@ -19,15 +19,16 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/maritimeconnectivity/MMS/mmtp"
 	"github.com/maritimeconnectivity/MMS/utils/errMsg"
 	"github.com/maritimeconnectivity/MMS/utils/rw"
-	"log"
-	"net/http"
-	"nhooyr.io/websocket"
-	"sync"
-	"time"
 )
 
 type Consumer struct {
@@ -130,7 +131,7 @@ func (c *Consumer) HandleReceive(mmtpMessage *mmtp.MmtpMessage, request *http.Re
 		if msgUuids := receive.GetFilter().GetMessageUuids(); msgUuids != nil {
 			msgsLen := len(msgUuids)
 			mmtpMessages := make([]*mmtp.MmtpMessage, 0, msgsLen)
-			appMsgs := make([]*mmtp.ApplicationMessage, 0, msgsLen)
+			msgContents := make([]*mmtp.MessageContent, 0, msgsLen)
 			c.MsgMu.Lock()
 			c.NotifyMu.Lock()
 			for _, msgUuid := range msgUuids {
@@ -138,7 +139,10 @@ func (c *Consumer) HandleReceive(mmtpMessage *mmtp.MmtpMessage, request *http.Re
 				if exists {
 					msg := mmtpMsg.GetProtocolMessage().GetSendMessage().GetApplicationMessage()
 					mmtpMessages = append(mmtpMessages, mmtpMsg)
-					appMsgs = append(appMsgs, msg)
+					msgContents = append(msgContents, &mmtp.MessageContent{
+						Uuid: msgUuid,
+						Msg:  msg,
+					})
 					delete(c.Messages, msgUuid)
 					delete(c.Notifications, msgUuid) //Delete upcoming notification
 				}
@@ -148,9 +152,9 @@ func (c *Consumer) HandleReceive(mmtpMessage *mmtp.MmtpMessage, request *http.Re
 				MsgType: mmtp.MsgType_RESPONSE_MESSAGE,
 				Uuid:    uuid.NewString(),
 				Body: &mmtp.MmtpMessage_ResponseMessage{ResponseMessage: &mmtp.ResponseMessage{
-					ResponseToUuid:      mmtpMessage.GetUuid(),
-					Response:            mmtp.ResponseEnum_GOOD,
-					ApplicationMessages: appMsgs,
+					ResponseToUuid: mmtpMessage.GetUuid(),
+					Response:       mmtp.ResponseEnum_GOOD,
+					MessageContent: msgContents,
 				}},
 			}
 			err := rw.WriteMessage(request.Context(), conn, resp)
@@ -162,13 +166,18 @@ func (c *Consumer) HandleReceive(mmtpMessage *mmtp.MmtpMessage, request *http.Re
 		} else { // Receive all messages
 			c.MsgMu.Lock()
 			msgsLen := len(c.Messages)
-			appMsgs := make([]*mmtp.ApplicationMessage, 0, msgsLen)
-			now := time.Now().UnixMilli()
+			msgContents := make([]*mmtp.MessageContent, 0, msgsLen)
+
+			now := time.Now().Unix()
 			c.NotifyMu.Lock()
 			for msgUuid, mmtpMsg := range c.Messages {
 				msg := mmtpMsg.GetProtocolMessage().GetSendMessage().GetApplicationMessage()
 				if now <= msg.Header.Expires {
-					appMsgs = append(appMsgs, msg)
+					//Create new msg Content entry
+					msgContents = append(msgContents, &mmtp.MessageContent{
+						Uuid: msgUuid,
+						Msg:  msg,
+					})
 					delete(c.Notifications, msgUuid) //Delete upcoming notification
 				}
 			}
@@ -177,9 +186,9 @@ func (c *Consumer) HandleReceive(mmtpMessage *mmtp.MmtpMessage, request *http.Re
 				MsgType: mmtp.MsgType_RESPONSE_MESSAGE,
 				Uuid:    uuid.NewString(),
 				Body: &mmtp.MmtpMessage_ResponseMessage{ResponseMessage: &mmtp.ResponseMessage{
-					ResponseToUuid:      mmtpMessage.GetUuid(),
-					Response:            mmtp.ResponseEnum_GOOD,
-					ApplicationMessages: appMsgs,
+					ResponseToUuid: mmtpMessage.GetUuid(),
+					Response:       mmtp.ResponseEnum_GOOD,
+					MessageContent: msgContents,
 				}},
 			}
 
@@ -227,7 +236,7 @@ func (c *Consumer) HandleFetch(mmtpMessage *mmtp.MmtpMessage, request *http.Requ
 		c.MsgMu.Lock()
 		defer c.MsgMu.Unlock()
 		metadata := make([]*mmtp.MessageMetadata, 0, len(c.Messages))
-		now := time.Now().UnixMilli()
+		now := time.Now().Unix()
 		for _, msg := range c.Messages {
 			msgHeader := msg.GetProtocolMessage().GetSendMessage().GetApplicationMessage().GetHeader()
 			// If the message has expired, we might as well just delete it

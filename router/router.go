@@ -26,7 +26,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/charmbracelet/log"
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -36,27 +48,21 @@ import (
 	peerstore "github.com/libp2p/go-libp2p/core/peer"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
+	"github.com/libp2p/go-libp2p/p2p/host/observedaddrs"
 	"github.com/maritimeconnectivity/MMS/consumer"
 	"github.com/maritimeconnectivity/MMS/mmtp"
 	"github.com/maritimeconnectivity/MMS/utils/auth"
 	"github.com/maritimeconnectivity/MMS/utils/errMsg"
 	"github.com/maritimeconnectivity/MMS/utils/revocation"
 	"github.com/maritimeconnectivity/MMS/utils/rw"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/protobuf/proto"
-	"net/http"
-	"nhooyr.io/websocket"
-	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
 )
 
 const (
-	WsReadLimit      int64         = 1 << 20             // 1 MiB = 1048576 B
+	WsReadLimit      int64         = -1                  // 1 MiB = 1048576 B
 	MessageSizeLimit int           = 50 * (1 << 10)      // 50 KiB = 51200 B
 	ExpirationLimit  time.Duration = time.Hour * 24 * 30 // 30 days
 	ChannelBufSize   int           = 1048576
@@ -107,9 +113,10 @@ type MMSRouter struct {
 	topicHandles    map[string]*pubsub.Topic // a map of Topic handles
 	incomingChannel chan *mmtp.MmtpMessage   // channel for incoming messages
 	outgoingChannel chan *mmtp.MmtpMessage   // channel for outgoing messages
+	geoLocation     string                   //Lookup code for the actual position of the running instance
 }
 
-func NewMMSRouter(p2p *host.Host, pubSub *pubsub.PubSub, listeningAddr string, incomingChannel chan *mmtp.MmtpMessage, outgoingChannel chan *mmtp.MmtpMessage, ctx context.Context, wg *sync.WaitGroup, clientCAs *string) (*MMSRouter, error) {
+func NewMMSRouter(p2p *host.Host, pubSub *pubsub.PubSub, listeningAddr string, incomingChannel chan *mmtp.MmtpMessage, outgoingChannel chan *mmtp.MmtpMessage, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, geoloc string) (*MMSRouter, error) {
 	subs := make(map[string]*Subscription)
 	subMu := &sync.RWMutex{}
 	edgeRouters := make(map[string]*EdgeRouter)
@@ -150,6 +157,7 @@ func NewMMSRouter(p2p *host.Host, pubSub *pubsub.PubSub, listeningAddr string, i
 		topicHandles:    topicHandles,
 		incomingChannel: incomingChannel,
 		outgoingChannel: outgoingChannel,
+		geoLocation:     geoloc,
 	}, nil
 }
 
@@ -159,7 +167,14 @@ func (r *MMSRouter) StartRouter(ctx context.Context, wg *sync.WaitGroup, certPat
 	go func() {
 		log.Infof("Websocket listening on: %v", r.httpServer.Addr)
 		if *certPath != "" && *certKeyPath != "" {
-			if err := r.httpServer.ListenAndServeTLS(*certPath, *certKeyPath); err != nil {
+			r.httpServer.TLSConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				cert, err := tls.LoadX509KeyPair(*certPath, *certKeyPath)
+				if err != nil {
+					return nil, err
+				}
+				return &cert, nil
+			}
+			if err := r.httpServer.ListenAndServeTLS("", ""); err != nil {
 				log.Error(err)
 			}
 		} else {
@@ -191,7 +206,7 @@ func (r *MMSRouter) messageGC(ctx context.Context, wg *sync.WaitGroup) {
 			return
 		case <-time.After(5 * time.Minute): // run every 5 minutes
 			r.erMu.RLock()
-			now := time.Now().UnixMilli()
+			now := time.Now().Unix()
 			for _, er := range r.edgeRouters {
 				er.MsgMu.Lock()
 				for _, m := range er.Messages {
@@ -218,7 +233,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 		}
 		defer func(c *websocket.Conn, code websocket.StatusCode, reason string) {
 			err := c.Close(code, reason)
-			if err != nil {
+			if err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Errorf("Could not close connection: %v", err)
 			}
 			wg.Done()
@@ -424,7 +439,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 								errMsg.SendErrorMessage(mmtpMessage.GetUuid(), "The message size exceeds the allowed 50 KiB", request.Context(), c)
 								break
 							}
-							handleSend(mmtpMessage, outgoingChannel, erMu, subMu, subs, e)
+							handleSend(mmtpMessage, outgoingChannel, erMu, subMu, subs, e, request, c)
 						}
 					case mmtp.ProtocolMessageType_RECEIVE_MESSAGE:
 						{
@@ -567,7 +582,7 @@ func handleUnsubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs 
 	return err
 }
 
-func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.MmtpMessage, erMu *sync.RWMutex, subMu *sync.RWMutex, subs map[string]*Subscription, e *EdgeRouter) {
+func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.MmtpMessage, erMu *sync.RWMutex, subMu *sync.RWMutex, subs map[string]*Subscription, e *EdgeRouter, request *http.Request, c *websocket.Conn) {
 	if send := mmtpMessage.GetProtocolMessage().GetSendMessage(); send != nil {
 		outgoingChannel <- mmtpMessage
 		header := send.GetApplicationMessage().GetHeader()
@@ -583,6 +598,7 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 						if er.Mrn != e.Mrn { // Do not send the message back to where it came from
 							if err := er.QueueMessage(mmtpMessage); err != nil {
 								log.Errorf("Could not queue message to Edge Router: %v", err)
+								return
 							}
 						}
 					}
@@ -598,11 +614,24 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 					if subscriber.Mrn != e.Mrn {
 						if err := subscriber.QueueMessage(mmtpMessage); err != nil {
 							log.Errorf("Could not queue message to Edge Router: %v", err)
+							return
 						}
 					}
 				}
 			}
 			subMu.RUnlock()
+		}
+		resp := &mmtp.MmtpMessage{
+			MsgType: mmtp.MsgType_RESPONSE_MESSAGE,
+			Uuid:    uuid.NewString(),
+			Body: &mmtp.MmtpMessage_ResponseMessage{
+				ResponseMessage: &mmtp.ResponseMessage{
+					ResponseToUuid: mmtpMessage.GetUuid(),
+					Response:       mmtp.ResponseEnum_GOOD,
+				}},
+		}
+		if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
+			log.Error("Could not send Send OK response:", err)
 		}
 	}
 }
@@ -688,10 +717,10 @@ func handleIncomingMessages(ctx context.Context, router *MMSRouter, wg *sync.Wai
 				case mmtp.MsgType_PROTOCOL_MESSAGE:
 					{
 						now := time.Now()
-						nowMilli := now.UnixMilli()
+						nowSeconds := now.Unix()
 						appMsg := incomingMessage.GetProtocolMessage().GetSendMessage().GetApplicationMessage()
 						msgExpires := appMsg.GetHeader().GetExpires()
-						if appMsg == nil || nowMilli > msgExpires || msgExpires > now.Add(ExpirationLimit).UnixMilli() {
+						if appMsg == nil || nowSeconds > msgExpires || msgExpires > now.Add(ExpirationLimit).Unix() {
 							// message is nil, expired or has a too long expiration, so we discard it
 							continue
 						}
@@ -798,6 +827,81 @@ func handleOutgoingMessages(ctx context.Context, router *MMSRouter, wg *sync.Wai
 	}
 }
 
+func recordMetrics(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry, r *MMSRouter) {
+	defer wg.Done()
+	memAlloc := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "router_heap_mem_alloc",
+		Help: "The amount of heap allocated memory in KB",
+	})
+
+	geo := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "loc_export_router",                         // Name of the metric
+			Help: "A metric to store geo-location as a label", // Description of the metric
+		},
+		[]string{"lookup"}, // Define the label key (in this case "location")
+	)
+
+	geoDataFlow := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "loc_export2_router",                                // Name of the metric
+			Help: "A metric mapping geo_Location and active dataflow", // Description of the metric
+		},
+		[]string{"lookup2"}, // Define the label key (in this case "location")
+	)
+
+	reg.MustRegister(memAlloc)
+	if r.geoLocation != "" {
+		reg.MustRegister(geo)
+		reg.MustRegister(geoDataFlow)
+	} else {
+		log.Fatal("NOT SET")
+	}
+	geo.With(prometheus.Labels{"lookup": r.geoLocation}).Set(1)
+
+	var m runtime.MemStats
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+			runtime.ReadMemStats(&m)
+			memAlloc.Set(float64(m.Alloc / 1024))
+			geoDataFlow.With(prometheus.Labels{"lookup2": r.geoLocation}).Set(float64(m.Alloc / 1024))
+
+		}
+	}
+}
+
+func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry) {
+	defer wg.Done()
+
+	// Start the Prometheus metrics server
+	server := &http.Server{
+		Addr:    ":2113",
+		Handler: http.DefaultServeMux,
+	}
+	log.Info("Start prometheus server port 2113")
+
+	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Errorf("ListenAndServe(): %s", err)
+		}
+	}()
+
+	// Listen for context cancellation to gracefully shutdown the server
+	<-ctx.Done()
+	log.Warn("Shutting down Prometheus server...")
+
+	if err := server.Shutdown(context.Background()); err != nil {
+		log.Errorf("Server Shutdown: %s", err)
+	}
+}
+
 func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) (host.Host, *drouting.RoutingDiscovery, error) {
 	port := *libp2pPort
 	var addrStrings []string
@@ -832,7 +936,7 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 		}
 	}
 
-	identify.ActivationThresh = 3
+	observedaddrs.ActivationThresh = 3
 
 	var node host.Host
 	if *privKeyFilePath != "" {
@@ -921,6 +1025,7 @@ func main() {
 	certKeyPath := flag.String("cert-key-path", "", "Path to a TLS certificate private key. If none is provided, TLS will be disabled.")
 	clientCAs := flag.String("client-ca", "", "Path to a file containing a list of client CAs that can connect to this Router.")
 	beacons := flag.String("beacons", "beacons.txt", "Path to a file containing beacons, who this router can use to connect to the libp2p network.")
+	geoLoc := flag.String("l", "DNK", "Lookup code indicating the geo location of the running instance")
 
 	flag.Parse()
 
@@ -956,7 +1061,7 @@ func main() {
 			log.Infof("Peer: %v", p)
 			err := node.Connect(ctx, p)
 			if err != nil {
-				log.Errorf("Failed connecting to %v", p.ID.String(), ", error: %v", err)
+				log.Errorf("Failed connecting to %v: %s", p.ID.String(), err)
 			} else {
 				log.Infof("Connected to: %v", p.ID.String())
 				anyConnected = true
@@ -972,11 +1077,16 @@ func main() {
 
 	wg := &sync.WaitGroup{}
 
-	router, err := NewMMSRouter(&node, pubSub, ":"+strconv.Itoa(*listeningPort), incomingChannel, outgoingChannel, ctx, wg, clientCAs)
+	router, err := NewMMSRouter(&node, pubSub, ":"+strconv.Itoa(*listeningPort), incomingChannel, outgoingChannel, ctx, wg, clientCAs, *geoLoc)
 	if err != nil {
 		log.Fatal("Could not create MMS Router instance:", err)
 		return
 	}
+
+	wg.Add(2)
+	reg := prometheus.NewRegistry()
+	go recordMetrics(ctx, wg, reg, router)
+	go runPrometheusMetricsServer(ctx, wg, reg)
 
 	wg.Add(1)
 	go router.StartRouter(ctx, wg, certPath, certKeyPath)
