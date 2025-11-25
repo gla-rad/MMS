@@ -25,7 +25,7 @@
 #
 
 # Start with the official Golang image
-FROM golang:1.22 as builder
+FROM golang:1.25 as builder
 
 # Set the Current Working Directory inside the container
 WORKDIR /edgerouter
@@ -46,6 +46,8 @@ RUN go build -o edgerouter .
 
 # Start a new stage from scratch
 FROM debian:bookworm
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Set the Current Working Directory inside the container
 WORKDIR /edgerouter

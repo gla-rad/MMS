@@ -14,7 +14,7 @@
 #       <image-id>
 #
 # You can also push to docker-hub like:
-#     docker push glarad/mc-mms-edgerouter:tagname
+#     docker push glarad/mc-mms-router:tagname
 #
 # A customized conf file (application.properties) can be made available in the folder mounted to /conf.
 # When using in non-local environment it is recommended to generate new trust and keystores and place them in
@@ -22,7 +22,7 @@
 #
 
 # Start with the official Golang image
-FROM golang:1.22 as builder
+FROM golang:1.25 as builder
 
 # Set the Current Working Directory inside the container
 WORKDIR /router
@@ -43,6 +43,8 @@ RUN go build -o router .
 
 # Start a new stage from scratch
 FROM debian:bookworm
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Set the Current Working Directory inside the container
 WORKDIR /router

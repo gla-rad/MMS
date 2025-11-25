@@ -35,7 +35,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: images/edgerouter
+          file: docker/Dockerfile.edgerouter
           tags: ghcr.io/gla-rad/mc-mms-edgerouter
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
@@ -65,7 +65,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: images/router
+          file: docker/Dockerfile.router
           tags: ghcr.io/gla-rad/mc-mms-router
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
