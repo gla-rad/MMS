@@ -36,7 +36,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: images/edgerouter
-          tags: ghcr.io/gla-rad/edgerouter
+          tags: ghcr.io/gla-rad/mc-mms-edgerouter
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
   build-router:
@@ -66,6 +66,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: images/router
-          tags: ghcr.io/gla-rad/router
+          tags: ghcr.io/gla-rad/mc-mms-router
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
