@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Initialize the command with the executable
-CMD="./edgerouter"
+CMD="./edgerouter -i -d"
 
 # Check if MRN is set and non-empty
 if [ ! -z "$MRN" ]; then
