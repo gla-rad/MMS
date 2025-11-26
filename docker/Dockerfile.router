@@ -42,7 +42,7 @@ COPY ./consumer/ ../consumer/
 RUN go build -o router .
 
 # Start a new stage from scratch
-FROM debian:bookworm
+FROM debian:trixie
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 

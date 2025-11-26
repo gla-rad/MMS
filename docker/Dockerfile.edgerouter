@@ -45,7 +45,7 @@ COPY ./consumer/ /consumer/
 RUN go build -o edgerouter .
 
 # Start a new stage from scratch
-FROM debian:bookworm
+FROM debian:trixie
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -68,7 +68,7 @@ EXPOSE 8080
 EXPOSE 9000
 
 # Set default environment variables
-ENV MRN="urn:mrn:mcp:device:idp1:org1:er"
+ENV MRN=""
 ENV RADDR="ws://localhost:8080"
 ENV PORT="8080"
 ENV CLIENT_CERT_PATH=""
