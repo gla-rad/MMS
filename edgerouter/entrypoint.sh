@@ -50,7 +50,7 @@ fi
 if [ ! -z "$CLIENT_CA" ]; then
   if [ -s "$CLIENT_CA" ]; then
     CMD="$CMD --client-ca $CLIENT_CA"
-  FI
+  fi
 fi
 
 # Execute the constructed command
