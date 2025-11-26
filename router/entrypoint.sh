@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Initialize the command with the executable
-CMD="./router -i -d"
+CMD="./router"
 
 # Check if PORT is set and non-empty
 if [ ! -z "$PORT" ]; then
