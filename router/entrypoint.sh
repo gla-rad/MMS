@@ -15,27 +15,37 @@ fi
 
 # Check if PRIVKEY is set and non-empty
 if [ ! -z "$PRIVKEY" ]; then
-  CMD="$CMD --privkey $PRIVKEY"
+  if  -s "$PRIVKEY" ]; then
+    CMD="$CMD --privkey $PRIVKEY"
+  fi
 fi
 
 # Check if CERT_PATH is set and non-empty
 if [ ! -z "$CERT_PATH" ]; then
-  CMD="$CMD --cert-path $CERT_PATH"
+  if [ -s "$CERT_PATH" ]; then
+    CMD="$CMD --cert-path $CERT_PATH"
+  fi
 fi
 
 # Check if CERT_KEY_PATH is set and non-empty
 if [ ! -z "$CERT_KEY_PATH" ]; then
-  CMD="$CMD --cert-key-path $CERT_KEY_PATH"
+  if [ -s "$CERT_KEY_PATH" ]; then
+    CMD="$CMD --cert-key-path $CERT_KEY_PATH"
+  fi
 fi
 
 # Check if CLIENT_CA is set and non-empty
 if [ ! -z "$CLIENT_CA" ]; then
-  CMD="$CMD --client-ca $CLIENT_CA"
+  if [ -s "$CLIENT_CA" ]; then
+    CMD="$CMD --client-ca $CLIENT_CA"
+  fi
 fi
 
 # Check if BEACONS is set and non-empty
 if [ ! -z "$BEACONS" ]; then
-  CMD="$CMD --beacons $BEACONS"
+  if [ -s "$BEACONS" ]; then
+    CMD="$CMD --beacons $BEACONS"
+  fi
 fi
 
 # Execute the constructed command
