@@ -17,7 +17,7 @@ incurred from its use.
 
 ## Prerequisites
 
-* Go version 1.23 or higher
+* Go version 1.26 or higher
 
 ## Build
 
@@ -56,6 +56,12 @@ connect to router identities specified in the `beacons.txt`
   router, listening on the QUIC protocol on UDP port 27000. It has the libp2p-identity
   `QmcUKyMuepvXqZhpMSBP59KKBymRNstk41qGMPj38QStfx`, which is derived from the private key.
 
+### Calculating a key id
+
+A small utility is provided to simplify calculating the key id for `beacons.txt`:
+
+* `./bin/genkey -privkey path/to/private/key.pem`
+
 ## How to run
 
 ### Edgerouter
@@ -75,9 +81,15 @@ restrictions on the allowed operations.
 * `cert-key-path` Path to the TLS-certificate private key
 * `client-ca` Path to a file containing a list of client CAs that can connect to this Edge Router. This is necessary for
   proper validation of client (Agent) certificates
+* `tlsca` Path to a file containing trusted TLS CA certificates to use when connecting to the Router. If not set, the
+  system CA store is used.
 * `l` Location of the actual instance in ISO 3166 country code format. This is to be used for monitoring.
 * `i` Allow insecure TLS, i.e. no validation of CA.
 * `d` Debug statements are printed
+* `prometheus-port` The port number for the Prometheus metrics server. Defaults to `2112`.
+* `health-port` The port number for the plaintext health check server, exposing a `/health` endpoint. Defaults to
+  `8889`.
+* `skip-revocation-check` Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.
 
 #### Usage example
 
@@ -96,7 +108,8 @@ restrictions on the allowed operations.
 #### Flags
 
 * `port` The port number that this router should listen on. Edgerouters shall use this port to connect to the router. '
-* `libp2p-port` The libp2p port exposed by this router to the MMS router network
+* `libp2p-port` The libp2p port exposed by this router to the MMS router network for UDP/QUIC
+* `libp2p-tcp-port` The TCP port for libp2p. Defaults to the same as `libp2p-port` if not set.
 * `privkey` Path to a file containing a private key for use within libp2p. If none is provided, a new private key will
   be generated every time the program is run. To uniquely identify a router and connect to that router (through the
   `beacons.txt`) configuration, a key must be provided.
@@ -105,9 +118,14 @@ restrictions on the allowed operations.
 * `cert-key-path` Path to the TLS-certificate private key
 * `client-ca` Path to a file containing a list of client CAs that can connect to this router. This is necessary for
   proper validation of client (edgerouter) certificates
+* `d` Debug statements are printed
 * `beacons` Path to a file containing known routers that this router can use to connect to the libp2p network. If not
   set the router will search for a `beacons.txt` file in its own directory.
 * `l` Location of the actual instance in ISO 3166 country code format. This is to be used for monitoring.
+* `prometheus-port` The port number for the Prometheus metrics server. Defaults to `2113`.
+* `health-port` The port number for the plaintext health check server, exposing a `/health` endpoint. Defaults to
+  `8081`.
+* `skip-revocation-check` Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.
 
 #### Usage example
 

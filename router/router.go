@@ -52,6 +52,7 @@ import (
 	"github.com/maritimeconnectivity/MMS/consumer"
 	"github.com/maritimeconnectivity/MMS/mmtp"
 	"github.com/maritimeconnectivity/MMS/utils/auth"
+	"github.com/maritimeconnectivity/MMS/utils/cert"
 	"github.com/maritimeconnectivity/MMS/utils/errMsg"
 	"github.com/maritimeconnectivity/MMS/utils/revocation"
 	"github.com/maritimeconnectivity/MMS/utils/rw"
@@ -116,23 +117,16 @@ type MMSRouter struct {
 	geoLocation     string                   //Lookup code for the actual position of the running instance
 }
 
-func NewMMSRouter(p2p *host.Host, pubSub *pubsub.PubSub, listeningAddr string, incomingChannel chan *mmtp.MmtpMessage, outgoingChannel chan *mmtp.MmtpMessage, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, geoloc string) (*MMSRouter, error) {
+func NewMMSRouter(p2p *host.Host, pubSub *pubsub.PubSub, listeningAddr string, incomingChannel chan *mmtp.MmtpMessage, outgoingChannel chan *mmtp.MmtpMessage, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, geoloc string, skipRevocationCheck bool) (*MMSRouter, error) {
 	subs := make(map[string]*Subscription)
 	subMu := &sync.RWMutex{}
 	edgeRouters := make(map[string]*EdgeRouter)
 	erMu := &sync.RWMutex{}
 	topicHandles := make(map[string]*pubsub.Topic)
 
-	var certPool *x509.CertPool = nil
-	if *clientCAs != "" {
-		certPool = x509.NewCertPool()
-		certFile, err := os.ReadFile(*clientCAs)
-		if err != nil {
-			return nil, fmt.Errorf("could not read the given client CA file")
-		}
-		if !certPool.AppendCertsFromPEM(certFile) {
-			return nil, fmt.Errorf("could not read the given client CA file")
-		}
+	clientCaPool, err := cert.LoadCertPool(*clientCAs)
+	if err != nil {
+		return nil, err
 	}
 
 	httpServer := http.Server{
@@ -140,9 +134,9 @@ func NewMMSRouter(p2p *host.Host, pubSub *pubsub.PubSub, listeningAddr string, i
 		Handler: handleHttpConnection(p2p, pubSub, incomingChannel, outgoingChannel, subs, subMu, edgeRouters, erMu, topicHandles, ctx, wg),
 		TLSConfig: &tls.Config{
 			ClientAuth:            tls.RequireAndVerifyClientCert,
-			ClientCAs:             certPool, // this should come from a file containing the CAs we trust
+			ClientCAs:             clientCaPool,
 			MinVersion:            tls.VersionTLS12,
-			VerifyPeerCertificate: verifyEdgeRouterCertificate(),
+			VerifyPeerCertificate: verifyEdgeRouterCertificate(skipRevocationCheck),
 		},
 	}
 
@@ -168,11 +162,11 @@ func (r *MMSRouter) StartRouter(ctx context.Context, wg *sync.WaitGroup, certPat
 		log.Infof("Websocket listening on: %v", r.httpServer.Addr)
 		if *certPath != "" && *certKeyPath != "" {
 			r.httpServer.TLSConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				cert, err := tls.LoadX509KeyPair(*certPath, *certKeyPath)
+				certificate, err := tls.LoadX509KeyPair(*certPath, *certKeyPath)
 				if err != nil {
 					return nil, err
 				}
-				return &cert, nil
+				return &certificate, nil
 			}
 			if err := r.httpServer.ListenAndServeTLS("", ""); err != nil {
 				log.Error(err)
@@ -232,6 +226,11 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 			return
 		}
 		defer func(c *websocket.Conn, code websocket.StatusCode, reason string) {
+			if err != nil {
+				log.Info("Closing connection", "err", err.Error())
+			} else {
+				log.Debug("Closing connection, err=nil")
+			}
 			err := c.Close(code, reason)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Errorf("Could not close connection: %v", err)
@@ -243,6 +242,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 		c.SetReadLimit(WsReadLimit)
 
 		mmtpMessage, _, err := rw.ReadMessage(ctx, c)
+		log.Debugf("Handling incoming message %v", mmtpMessage)
 		if err != nil {
 			log.Warnf("Could not read message: %v", err)
 			if err = c.Close(websocket.StatusUnsupportedData, "The first message could not be parsed as an MMTP message"); err != nil {
@@ -321,6 +321,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 							ReasonText:     &errorMsg,
 						}},
 				}
+				log.Debugf("Sending message %v", resp)
 				err = rw.WriteMessage(request.Context(), c, resp)
 				if err != nil {
 					log.Errorf("Could not send response message: %v", err)
@@ -339,6 +340,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 							ReasonText:     &errorMsg,
 						}},
 				}
+				log.Debugf("Sending message %v", resp)
 				err = rw.WriteMessage(request.Context(), c, resp)
 				if err != nil {
 					log.Errorf("Could not send response message: %v", err)
@@ -374,6 +376,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 					Response:       mmtp.ResponseEnum_GOOD,
 				}},
 		}
+		log.Debugf("Sending message %v", resp)
 		err = rw.WriteMessage(request.Context(), c, resp)
 		if err != nil {
 			log.Errorf("Could not send response message: %v", err)
@@ -388,6 +391,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 
 		for {
 			mmtpMessage, n, err := rw.ReadMessage(ctx, c)
+			log.Debugf("Handling received message %v", mmtpMessage)
 			if err != nil {
 				log.Errorf("Could not receive message: %v", err)
 				reasonText := "Message could not be correctly parsed"
@@ -402,6 +406,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 						},
 					},
 				}
+				log.Debugf("Sending message %v", resp)
 				if err = rw.WriteMessage(request.Context(), c, resp); err != nil {
 					return
 				}
@@ -421,7 +426,7 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 					switch protoMessage.ProtocolMsgType {
 					case mmtp.ProtocolMessageType_SUBSCRIBE_MESSAGE:
 						{
-							err, errorText := handleSubscribe(mmtpMessage, subMu, subs, topicHandles, pubSub, e, wg, ctx, p2p, incomingChannel, request, c)
+							errorText, err := handleSubscribe(mmtpMessage, subMu, subs, topicHandles, pubSub, e, wg, ctx, p2p, incomingChannel, request, c)
 							if err != nil {
 								log.Error("Failed handling Subscribe message:", err)
 								errMsg.SendErrorMessage(mmtpMessage.GetUuid(), errorText, request.Context(), c)
@@ -476,11 +481,11 @@ func handleHttpConnection(p2p *host.Host, pubSub *pubsub.PubSub, incomingChannel
 	}
 }
 
-func handleSubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs map[string]*Subscription, topicHandles map[string]*pubsub.Topic, pubSub *pubsub.PubSub, e *EdgeRouter, wg *sync.WaitGroup, ctx context.Context, p2p *host.Host, incomingChannel chan *mmtp.MmtpMessage, request *http.Request, c *websocket.Conn) (error, string) {
+func handleSubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs map[string]*Subscription, topicHandles map[string]*pubsub.Topic, pubSub *pubsub.PubSub, e *EdgeRouter, wg *sync.WaitGroup, ctx context.Context, p2p *host.Host, incomingChannel chan *mmtp.MmtpMessage, request *http.Request, c *websocket.Conn) (string, error) {
 	if subscribe := mmtpMessage.GetProtocolMessage().GetSubscribeMessage(); subscribe != nil {
 		subject := subscribe.GetSubject()
 		if subject == "" {
-			return fmt.Errorf("cannot subscribe to empty subject"), "Cannot subscribe to empty subject"
+			return "Cannot subscribe to empty subject", fmt.Errorf("cannot subscribe to empty subject")
 		}
 		subMu.Lock()
 		sub, exists := subs[subject]
@@ -491,7 +496,7 @@ func handleSubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs ma
 				t, err := pubSub.Join(subject)
 				if err != nil {
 					subMu.Unlock()
-					return fmt.Errorf("was not able to join topic: %v", err), "Subscription failed"
+					return "Subscription failed", fmt.Errorf("was not able to join topic: %v", err)
 				}
 				topic = t
 				topicHandles[subject] = topic
@@ -501,7 +506,7 @@ func handleSubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs ma
 			subscription, err := topic.Subscribe()
 			if err != nil {
 				subMu.Unlock()
-				return fmt.Errorf("was not able to subscribe to topic: %v", err), "Subscription failed"
+				return "Subscription failed", fmt.Errorf("was not able to subscribe to topic: %v", err)
 			}
 			wg.Add(1)
 			go handleSubscription(ctx, subscription, p2p, incomingChannel, wg)
@@ -521,11 +526,12 @@ func handleSubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs ma
 					Response:       mmtp.ResponseEnum_GOOD,
 				}},
 		}
+		log.Debugf("Sending message %v", resp)
 		if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 			log.Errorf("Could not send subscribe response to Edge Router: %v", err)
 		}
 	}
-	return nil, ""
+	return "", nil
 }
 
 func handleUnsubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs map[string]*Subscription, e *EdgeRouter, request *http.Request, c *websocket.Conn) error {
@@ -546,6 +552,7 @@ func handleUnsubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs 
 			reasonText := "Tried to unsubscribe to empty subject"
 			resp.GetResponseMessage().Response = mmtp.ResponseEnum_ERROR
 			resp.GetResponseMessage().ReasonText = &reasonText
+			log.Debugf("Sending message %v", resp)
 			err := rw.WriteMessage(request.Context(), c, resp)
 			if err != nil {
 				err = fmt.Errorf("could not write response to unsubscribe message: %w", err)
@@ -574,6 +581,7 @@ func handleUnsubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs 
 		resp.GetResponseMessage().ReasonText = &reasonText
 	}
 
+	log.Debugf("Sending message %v", resp)
 	err := rw.WriteMessage(request.Context(), c, resp)
 	if err != nil {
 		err = fmt.Errorf("could not write response to unsubscribe message: %w", err)
@@ -583,6 +591,7 @@ func handleUnsubscribe(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex, subs 
 }
 
 func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.MmtpMessage, erMu *sync.RWMutex, subMu *sync.RWMutex, subs map[string]*Subscription, e *EdgeRouter, request *http.Request, c *websocket.Conn) {
+	log.Debugf("Sending message %v", mmtpMessage)
 	if send := mmtpMessage.GetProtocolMessage().GetSendMessage(); send != nil {
 		outgoingChannel <- mmtpMessage
 		header := send.GetApplicationMessage().GetHeader()
@@ -618,6 +627,8 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 						}
 					}
 				}
+			} else {
+				log.Debug("Not sending; no subscriber found for subject", header.GetSubject())
 			}
 			subMu.RUnlock()
 		}
@@ -630,13 +641,14 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 					Response:       mmtp.ResponseEnum_GOOD,
 				}},
 		}
+		log.Debugf("Sending message %v", resp)
 		if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 			log.Error("Could not send Send OK response:", err)
 		}
 	}
 }
 
-func verifyEdgeRouterCertificate() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+func verifyEdgeRouterCertificate(skipRevocationCheck bool) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 		// we did not receive a certificate from the client, so we just return early
 		if len(rawCerts) == 0 || len(verifiedChains) == 0 {
@@ -657,6 +669,8 @@ func verifyEdgeRouterCertificate() func(rawCerts [][]byte, verifiedChains [][]*x
 			if err != nil {
 				return err
 			}
+		} else if skipRevocationCheck {
+			log.Warn("was not able to check revocation status of client certificate")
 		} else {
 			return fmt.Errorf("was not able to check revocation status of client certificate")
 		}
@@ -713,15 +727,24 @@ func handleIncomingMessages(ctx context.Context, router *MMSRouter, wg *sync.Wai
 			return
 		default:
 			for incomingMessage := range router.incomingChannel {
+				log.Debugf("Handling incoming message %v", incomingMessage)
 				switch incomingMessage.GetMsgType() {
 				case mmtp.MsgType_PROTOCOL_MESSAGE:
 					{
 						now := time.Now()
 						nowSeconds := now.Unix()
 						appMsg := incomingMessage.GetProtocolMessage().GetSendMessage().GetApplicationMessage()
+						if appMsg == nil {
+							log.Warnf("Discarding message %s: application message is nil", incomingMessage.GetUuid())
+							continue
+						}
 						msgExpires := appMsg.GetHeader().GetExpires()
-						if appMsg == nil || nowSeconds > msgExpires || msgExpires > now.Add(ExpirationLimit).Unix() {
-							// message is nil, expired or has a too long expiration, so we discard it
+						if nowSeconds > msgExpires {
+							log.Warnf("Discarding message %s: expired at %v (now %v)", incomingMessage.GetUuid(), time.Unix(msgExpires, 0), now)
+							continue
+						}
+						if msgExpires > now.Add(ExpirationLimit).Unix() {
+							log.Warnf("Discarding message %s: expiration %v exceeds maximum allowed %v", incomingMessage.GetUuid(), time.Unix(msgExpires, 0), now.Add(ExpirationLimit))
 							continue
 						}
 						switch subjectOrRecipient := appMsg.GetHeader().GetSubjectOrRecipient().(type) {
@@ -768,6 +791,7 @@ func handleOutgoingMessages(ctx context.Context, router *MMSRouter, wg *sync.Wai
 			return
 		default:
 			for outgoingMessage := range router.outgoingChannel {
+				log.Debugf("Attempting to send message %v", outgoingMessage)
 				switch outgoingMessage.GetMsgType() {
 				case mmtp.MsgType_PROTOCOL_MESSAGE:
 					{
@@ -855,7 +879,7 @@ func recordMetrics(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Regi
 		reg.MustRegister(geo)
 		reg.MustRegister(geoDataFlow)
 	} else {
-		log.Fatal("NOT SET")
+		log.Warn("Geolocation not set")
 	}
 	geo.With(prometheus.Labels{"lookup": r.geoLocation}).Set(1)
 
@@ -873,25 +897,24 @@ func recordMetrics(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Regi
 	}
 }
 
-func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry) {
+func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry, port int) {
 	defer wg.Done()
 
 	// Start the Prometheus metrics server
+	addr := ":" + strconv.Itoa(port)
 	server := &http.Server{
-		Addr:    ":2113",
+		Addr:    addr,
 		Handler: http.DefaultServeMux,
 	}
-	log.Info("Start prometheus server port 2113")
+	log.Infof("Start prometheus server on port %d", port)
 
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Errorf("ListenAndServe(): %s", err)
 		}
-	}()
+	})
 
 	// Listen for context cancellation to gracefully shutdown the server
 	<-ctx.Done()
@@ -902,15 +925,54 @@ func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *pr
 	}
 }
 
-func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) (host.Host, *drouting.RoutingDiscovery, error) {
-	port := *libp2pPort
+func runHealthServer(ctx context.Context, wg *sync.WaitGroup, port int) {
+	defer wg.Done()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"healthy"}`)); err != nil {
+			log.Errorf("Could not write health response: %s", err)
+		}
+	})
+
+	addr := ":" + strconv.Itoa(port)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+	log.Infof("Health server listening on port %d", port)
+
+	wg.Go(func() {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Errorf("Health server ListenAndServe(): %s", err)
+		}
+	})
+
+	<-ctx.Done()
+	log.Warn("Shutting down health server...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("Health server shutdown: %s", err)
+	}
+}
+
+func setupLibP2P(ctx context.Context, libp2pPort *int, libp2pTcpPort *int, privKeyFilePath *string, beaconsFilePath *string) (host.Host, *drouting.RoutingDiscovery, *dht.IpfsDHT, error) {
+	udpPort := *libp2pPort
+	tcpPort := *libp2pTcpPort
+	if tcpPort == 0 {
+		tcpPort = udpPort
+	}
 	var addrStrings []string
-	if port != 0 {
+	if udpPort != 0 {
 		addrStrings = []string{
-			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port),
-			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port),
-			fmt.Sprintf("/ip6/::/udp/%d/quic-v1", port),
-			fmt.Sprintf("/ip6/::/tcp/%d", port),
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", udpPort),
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", tcpPort),
+			fmt.Sprintf("/ip6/::/udp/%d/quic-v1", udpPort),
+			fmt.Sprintf("/ip6/::/tcp/%d", tcpPort),
 		}
 	} else {
 		addrStrings = []string{
@@ -923,7 +985,7 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 	// TODO make the router discover its public IP address so it can be published
 
 	beacons := make([]peerstore.AddrInfo, 0, 1)
-	beaconsFile, err := os.Open("/conf/beacons.txt")
+	beaconsFile, err := os.Open(*beaconsFilePath)
 	if err == nil {
 		fileScanner := bufio.NewScanner(beaconsFile)
 		for fileScanner.Scan() {
@@ -942,18 +1004,18 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 	if *privKeyFilePath != "" {
 		privKeyFile, err := os.ReadFile(*privKeyFilePath)
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not open the provided private key file: %w", err)
+			return nil, nil, nil, fmt.Errorf("could not open the provided private key file: %w", err)
 		}
 		keyData, _ := pem.Decode(privKeyFile)
 		privKey, err := x509.ParseECPrivateKey(keyData.Bytes)
 		if err != nil {
 			privKeyPkcs8, err := x509.ParsePKCS8PrivateKey(keyData.Bytes)
 			if err != nil {
-				return nil, nil, fmt.Errorf("could not parse the provided private key file as an ECDSA key: %w", err)
+				return nil, nil, nil, fmt.Errorf("could not parse the provided private key file as an ECDSA key: %w", err)
 			}
 			v, ok := privKeyPkcs8.(*ecdsa.PrivateKey)
 			if !ok {
-				return nil, nil, fmt.Errorf("Error on type assertion of provided key as ecdsa Privatekey")
+				return nil, nil, nil, fmt.Errorf("error on type assertion of provided key as ecdsa privatekey")
 			}
 			//After dynamic assertion set privKey
 			privKey = v
@@ -961,7 +1023,7 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 
 		privEc, _, err := crypto.ECDSAKeyPairFromKey(privKey)
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not parse the ECDSA private key from the file: %w", err)
+			return nil, nil, nil, fmt.Errorf("could not parse the ECDSA private key from the file: %w", err)
 		}
 
 		// start a libp2p node with the given private key
@@ -974,7 +1036,7 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 			libp2p.EnableHolePunching(),
 		)
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not create a libp2p node: %w", err)
+			return nil, nil, nil, fmt.Errorf("could not create a libp2p node: %w", err)
 		}
 	} else {
 		var err error
@@ -987,11 +1049,11 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 			libp2p.EnableHolePunching(),
 		)
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not create a libp2p node: %w", err)
+			return nil, nil, nil, fmt.Errorf("could not create a libp2p node: %w", err)
 		}
 	}
 
-	kademlia, err := dht.New(ctx, node, dht.Mode(dht.ModeAutoServer), dht.BootstrapPeers(beacons...))
+	kademlia, err := dht.New(node, dht.Mode(dht.ModeAutoServer), dht.BootstrapPeers(beacons...))
 	if err != nil {
 		panic(err)
 	}
@@ -1010,35 +1072,59 @@ func setupLibP2P(ctx context.Context, libp2pPort *int, privKeyFilePath *string) 
 		Addrs: node.Addrs(),
 	}
 	addrs, err := peerstore.AddrInfoToP2pAddrs(&peerInfo)
-	log.Infof("libp2p node addresses: %v", addrs)
-	return node, rd, nil
+	if err == nil {
+		log.Infof("libp2p node addresses: %v", addrs)
+	}
+	return node, rd, kademlia, nil
 }
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	listeningPort := flag.Int("port", 8080, "The port number that this Router should listen on.")
-	libp2pPort := flag.Int("libp2p-port", 0, "The port number that this Router should use to "+
-		"open up to the Router Network. If not set, a random port is chosen.")
+	libp2pPort := flag.Int("libp2p-port", 0, "The port number that this Router should use for UDP/QUIC "+
+		"to the Router Network. If not set, a random port is chosen.")
+	libp2pTcpPort := flag.Int("libp2p-tcp-port", 0, "The TCP port for libp2p. Defaults to the same as -libp2p-port if not set.")
 	privKeyFilePath := flag.String("privkey", "", "Path to a file containing a private key. If none is provided, a new private key will be generated every time the program is run.")
 	certPath := flag.String("cert-path", "", "Path to a TLS certificate file. If none is provided, TLS will be disabled.")
 	certKeyPath := flag.String("cert-key-path", "", "Path to a TLS certificate private key. If none is provided, TLS will be disabled.")
 	clientCAs := flag.String("client-ca", "", "Path to a file containing a list of client CAs that can connect to this Router.")
+	debug := flag.Bool("d", false, "Indicates whether debugging should be enabled, false by default")
 	beacons := flag.String("beacons", "beacons.txt", "Path to a file containing beacons, who this router can use to connect to the libp2p network.")
 	geoLoc := flag.String("l", "DNK", "Lookup code indicating the geo location of the running instance")
+	prometheusPort := flag.Int("prometheus-port", 2113, "The port number for the Prometheus metrics server.")
+	healthPort := flag.Int("health-port", 8081, "The port number for the plaintext health check server.")
+	skipRevocationCheck := flag.Bool("skip-revocation-check", false, "Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.")
 
 	flag.Parse()
+	if *debug {
+		log.SetLevel(log.DebugLevel)
+		log.Info("Operating in Debug mode")
+	} else {
+		log.SetLevel(log.InfoLevel)
+	}
 
 	if _, err := os.Stat(*beacons); err != nil {
 		log.Fatal(err)
 		return
 	}
 
-	node, rd, err := setupLibP2P(ctx, libp2pPort, privKeyFilePath)
+	node, rd, kademlia, err := setupLibP2P(ctx, libp2pPort, libp2pTcpPort, privKeyFilePath, beacons)
 	if err != nil {
 		log.Errorf("Could not setup the libp2p backend: %v", err)
 		return
 	}
+
+	// Make sure that the libp2p node and the DHT are always closed
+	defer func() {
+		// shut the libp2p node down, then close DHT
+		if err := node.Close(); err != nil {
+			log.Error("libp2p node could not be shut down correctly")
+		}
+		if err := kademlia.Close(); err != nil {
+			log.Error("kademlia DHT could not be shut down correctly")
+		}
+	}()
 
 	pubSub, err := pubsub.NewGossipSub(ctx, node)
 	if err != nil {
@@ -1077,7 +1163,7 @@ func main() {
 
 	wg := &sync.WaitGroup{}
 
-	router, err := NewMMSRouter(&node, pubSub, ":"+strconv.Itoa(*listeningPort), incomingChannel, outgoingChannel, ctx, wg, clientCAs, *geoLoc)
+	router, err := NewMMSRouter(&node, pubSub, ":"+strconv.Itoa(*listeningPort), incomingChannel, outgoingChannel, ctx, wg, clientCAs, *geoLoc, *skipRevocationCheck)
 	if err != nil {
 		log.Fatal("Could not create MMS Router instance:", err)
 		return
@@ -1086,7 +1172,10 @@ func main() {
 	wg.Add(2)
 	reg := prometheus.NewRegistry()
 	go recordMetrics(ctx, wg, reg, router)
-	go runPrometheusMetricsServer(ctx, wg, reg)
+	go runPrometheusMetricsServer(ctx, wg, reg, *prometheusPort)
+
+	wg.Add(1)
+	go runHealthServer(ctx, wg, *healthPort)
 
 	wg.Add(1)
 	go router.StartRouter(ctx, wg, certPath, certKeyPath)
@@ -1099,8 +1188,4 @@ func main() {
 
 	cancel()
 	wg.Wait()
-	// shut the libp2p node down
-	if err = node.Close(); err != nil {
-		log.Fatal("libp2p node could not be shut down correctly")
-	}
 }

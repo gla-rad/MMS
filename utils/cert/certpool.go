@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Maritime Connectivity Platform Consortium
+ * Copyright 2026 Maritime Connectivity Platform Consortium
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,29 +14,27 @@
  * limitations under the License.
  */
 
-package rw
+package cert
 
 import (
-	"context"
-	"errors"
+	"crypto/x509"
 	"fmt"
-
-	"github.com/coder/websocket"
-	"github.com/maritimeconnectivity/MMS/mmtp"
-	"google.golang.org/protobuf/proto"
+	"os"
 )
 
-func WriteMessage(ctx context.Context, c *websocket.Conn, mmtpMessage *mmtp.MmtpMessage) error {
-	if c == nil {
-		return errors.New("no websocket connection")
+// LoadCertPool reads a PEM-encoded CA file and returns a CertPool.
+// Returns (nil, nil) if caPath is empty.
+func LoadCertPool(caPath string) (*x509.CertPool, error) {
+	if caPath == "" {
+		return nil, nil
 	}
-	b, err := proto.Marshal(mmtpMessage)
+	pool := x509.NewCertPool()
+	certFile, err := os.ReadFile(caPath)
 	if err != nil {
-		return fmt.Errorf("could not marshal message: %w", err)
+		return nil, fmt.Errorf("could not read CA file %q: %w", caPath, err)
 	}
-	err = c.Write(ctx, websocket.MessageBinary, b)
-	if err != nil {
-		return fmt.Errorf("could not write message: %w", err)
+	if !pool.AppendCertsFromPEM(certFile) {
+		return nil, fmt.Errorf("could not parse PEM certificates from CA file %q", caPath)
 	}
-	return nil
+	return pool, nil
 }

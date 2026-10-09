@@ -23,6 +23,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -41,6 +42,7 @@ import (
 	"github.com/maritimeconnectivity/MMS/consumer"
 	"github.com/maritimeconnectivity/MMS/mmtp"
 	"github.com/maritimeconnectivity/MMS/utils/auth"
+	"github.com/maritimeconnectivity/MMS/utils/cert"
 	"github.com/maritimeconnectivity/MMS/utils/errMsg"
 	"github.com/maritimeconnectivity/MMS/utils/revocation"
 	"github.com/maritimeconnectivity/MMS/utils/rw"
@@ -50,7 +52,7 @@ import (
 )
 
 const (
-	WsReadLimit      int64 = -1                  // 1 MiB = 1048576 B
+	WsReadLimit      int64 = -1
 	MessageSizeLimit int   = 50 * (1 << 10)      // 50 KiB = 51200 B
 	ExpirationLimit        = time.Hour * 24 * 30 // 30 days
 	ChannelBufSize   int   = 1048576
@@ -61,7 +63,7 @@ type Agent struct {
 	consumer.Consumer        // A base struct that applies both to Agent and Edge Router consumers
 	agentUuid         string // UUID for uniquely identifying this Agent
 	directMessages    bool   // bool indicating whether the Agent is subscribing to direct messages
-	authenticated     bool   // bool indicating whther the Agent is authenticated
+	authenticated     bool   // bool indicating whether the Agent is authenticated
 }
 
 // Subscription type representing a subscription
@@ -91,9 +93,21 @@ func (sub *Subscription) DeleteSubscriber(agent *Agent) {
 	sub.subsMu.Unlock()
 }
 
+func (sub *Subscription) SnapshotSubscribers() []*Agent {
+	sub.subsMu.RLock()
+	defer sub.subsMu.RUnlock()
+
+	subscribers := make([]*Agent, 0, len(sub.Subscribers))
+	for _, subscriber := range sub.Subscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+
+	return subscribers
+}
+
 // EdgeRouter type representing an MMS Edge Router
 type EdgeRouter struct {
-	ownMrn          string                       // The MRN of this EdgeRouter
+	ownMrn          *string                      // The MRN of this EdgeRouter
 	subscriptions   map[string]*Subscription     // a mapping from Interest names to Subscription slices
 	subMu           *sync.RWMutex                // a Mutex for locking the subscriptions map
 	agents          map[string]*Agent            // a map of connected Agents
@@ -111,7 +125,7 @@ type EdgeRouter struct {
 	geoLocation     string                       //Lookup code for the actual position of the running instance
 }
 
-func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.MmtpMessage, routerWs *websocket.Conn, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, routerAddr *string, httpClient *http.Client, geoLoc string) (*EdgeRouter, error) {
+func NewEdgeRouter(listeningAddr string, mrn *string, outgoingChannel chan *mmtp.MmtpMessage, routerWs *websocket.Conn, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, routerAddr *string, httpClient *http.Client, geoLoc string, skipRevocationCheck bool) (*EdgeRouter, error) {
 	subs := make(map[string]*Subscription)
 	subMu := &sync.RWMutex{}
 	agents := make(map[string]*Agent)
@@ -122,16 +136,9 @@ func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.
 	responseMu := &sync.RWMutex{}
 	wsMu := &sync.RWMutex{}
 
-	var certPool *x509.CertPool = nil
-	if *clientCAs != "" {
-		certPool = x509.NewCertPool()
-		certFile, err := os.ReadFile(*clientCAs)
-		if err != nil {
-			return nil, fmt.Errorf("could not read the given client CA file")
-		}
-		if !certPool.AppendCertsFromPEM(certFile) {
-			return nil, fmt.Errorf("could not read the given client CA file")
-		}
+	clientCaPool, err := cert.LoadCertPool(*clientCAs)
+	if err != nil {
+		return nil, err
 	}
 
 	httpServer := http.Server{
@@ -139,9 +146,9 @@ func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.
 		Handler: handleHttpConnection(outgoingChannel, subs, subMu, agents, agentsMu, mrnToAgent, mrnToAgentMu, ctx, wg),
 		TLSConfig: &tls.Config{
 			ClientAuth:            tls.VerifyClientCertIfGiven,
-			ClientCAs:             certPool,
+			ClientCAs:             clientCaPool,
 			MinVersion:            tls.VersionTLS12,
-			VerifyPeerCertificate: verifyAgentCertificate(),
+			VerifyPeerCertificate: verifyAgentCertificate(skipRevocationCheck),
 		},
 	}
 
@@ -166,7 +173,7 @@ func NewEdgeRouter(listeningAddr string, mrn string, outgoingChannel chan *mmtp.
 }
 
 func (er *EdgeRouter) connectMMTPToRouter(ctx context.Context) error {
-	log.Debugf("Own mrn is %v", er.ownMrn)
+	log.Debugf("Own mrn is %s", *er.ownMrn)
 
 	connect := &mmtp.MmtpMessage{
 		MsgType: mmtp.MsgType_PROTOCOL_MESSAGE,
@@ -176,12 +183,13 @@ func (er *EdgeRouter) connectMMTPToRouter(ctx context.Context) error {
 				ProtocolMsgType: mmtp.ProtocolMessageType_CONNECT_MESSAGE,
 				Body: &mmtp.ProtocolMessage_ConnectMessage{
 					ConnectMessage: &mmtp.Connect{
-						OwnMrn: &er.ownMrn,
+						OwnMrn: er.ownMrn,
 					},
 				},
 			},
 		},
 	}
+	log.Debugf("Sending message %v", connect)
 	err := rw.WriteMessage(ctx, er.routerWs, connect)
 	if err != nil {
 		return fmt.Errorf("could not send connect message: %w", err)
@@ -193,7 +201,7 @@ func (er *EdgeRouter) connectMMTPToRouter(ctx context.Context) error {
 	}
 
 	connectResp := response.GetResponseMessage()
-	if connectResp.Response != mmtp.ResponseEnum_GOOD {
+	if connectResp.GetResponse() != mmtp.ResponseEnum_GOOD {
 		return fmt.Errorf("the MMS Router did not accept Connect: %s", connectResp.GetReasonText())
 	}
 
@@ -221,11 +229,11 @@ func (er *EdgeRouter) StartEdgeRouter(ctx context.Context, wg *sync.WaitGroup, c
 		log.Infof("Websocket listening on %s", er.httpServer.Addr)
 		if *certPath != "" && *certKeyPath != "" {
 			er.httpServer.TLSConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				cert, err := tls.LoadX509KeyPair(*certPath, *certKeyPath)
+				certificate, err := tls.LoadX509KeyPair(*certPath, *certKeyPath)
 				if err != nil {
 					return nil, err
 				}
-				return &cert, nil
+				return &certificate, nil
 			}
 			if err := er.httpServer.ListenAndServeTLS("", ""); err != nil {
 				log.Warn(err)
@@ -262,12 +270,13 @@ func (er *EdgeRouter) StartEdgeRouter(ctx context.Context, wg *sync.WaitGroup, c
 	}
 
 	if er.routerWs != nil {
+		log.Debugf("Sending message %v", disconnectMsg)
 		if err := rw.WriteMessage(context.Background(), er.routerWs, disconnectMsg); err != nil {
 			log.Warn("Could not send disconnect to Router:", err)
 		}
 
 		response, _, err := rw.ReadMessage(context.Background(), er.routerWs)
-		if err != nil || response.GetResponseMessage().Response != mmtp.ResponseEnum_GOOD {
+		if err != nil || response.GetResponseMessage().GetResponse() != mmtp.ResponseEnum_GOOD {
 			log.Warn("Graceful disconnect from Router failed")
 		}
 
@@ -352,7 +361,7 @@ func (er *EdgeRouter) messageGC(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-// This function adds a request to the outgoing ch to receive messages from the router upon receiving a notify from the router
+// This function adds a request to the outgoing ch to receive messages from the router upon receiving a Notify message from the router
 func (er *EdgeRouter) handleNotify(metadata []*mmtp.MessageMetadata) error {
 
 	//Filter such that we only request to receive messages we were notified about
@@ -393,6 +402,11 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 			return
 		}
 		defer func(c *websocket.Conn, code websocket.StatusCode, reason string) {
+			if err != nil {
+				log.Info("Closing connection", "err", err.Error())
+			} else {
+				log.Debug("Closing connection, err=nil")
+			}
 			err := c.Close(code, reason)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Errorf("Could not close connection: %s", err.Error())
@@ -495,13 +509,14 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 					Response:       mmtp.ResponseEnum_GOOD,
 				}},
 		}
+		log.Debugf("Sending message %v", resp)
 		err = rw.WriteMessage(request.Context(), c, resp)
 		if err != nil {
 			log.Error("Could not send response:", err)
 			return
 		}
 
-		//Start thread that checks for incoming messages and notfies agents
+		//Start thread that checks for incoming messages and notifies agents
 		wg.Add(1)
 		agCtx, cancel := context.WithCancel(ctx)
 		defer cancel() //When done handling client
@@ -523,6 +538,7 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 						},
 					},
 				}
+				log.Debugf("Sending message %v", resp)
 				if err = rw.WriteMessage(request.Context(), c, resp); err != nil {
 					return
 				}
@@ -577,7 +593,7 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 							if err = agent.HandleDisconnect(mmtpMessage, request, c); err != nil {
 								log.Error("Failed handling Disconnect message:", err)
 							} else {
-								//Sucess, remove agent from edgerouters map of agents and list of reconnecttokens
+								//Success, remove agent from edgerouter's map of agents and list of reconnect tokens
 								mrnToAgentMu.Lock()
 								delete(mrnToAgent, agent.Mrn)
 								mrnToAgentMu.Unlock()
@@ -612,6 +628,7 @@ func handleHttpConnection(outgoingChannel chan<- *mmtp.MmtpMessage, subs map[str
 							},
 						},
 					}
+					log.Debugf("Sending message %v", resp)
 					if err = rw.WriteMessage(request.Context(), c, resp); err != nil {
 						log.Error("Could not send error message:", err)
 						return
@@ -666,6 +683,7 @@ func handleSubscribeSubject(mmtpMessage *mmtp.MmtpMessage, agent *Agent, subMu *
 				Response:       mmtp.ResponseEnum_GOOD,
 			}},
 	}
+	log.Debugf("Sending message %v", resp)
 	if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 		return fmt.Errorf("could not send subscribe response to Agent: %w", err)
 	}
@@ -712,6 +730,7 @@ func handleSubscribeDirect(mmtpMessage *mmtp.MmtpMessage, agent *Agent, subscrib
 				Response:       mmtp.ResponseEnum_GOOD,
 			}},
 	}
+	log.Debugf("Sending message %v", resp)
 	if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 		return fmt.Errorf("could not send subscribe response to Agent: %w", err)
 	}
@@ -762,6 +781,7 @@ func handleUnsubscribeSubject(mmtpMessage *mmtp.MmtpMessage, subMu *sync.RWMutex
 				Response:       mmtp.ResponseEnum_GOOD,
 			}},
 	}
+	log.Debugf("Sending message %v", resp)
 	if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 		return fmt.Errorf("could not write response to unsubscribe message: %w", err)
 	}
@@ -805,6 +825,7 @@ func handleUnsubscribeDirect(mmtpMessage *mmtp.MmtpMessage, unsubscribe *mmtp.Un
 					Response:       mmtp.ResponseEnum_GOOD,
 				}},
 		}
+		log.Debugf("Sending message %v", resp)
 		if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 			return fmt.Errorf("could not send unsubscribe response to Agent: %w", err)
 		}
@@ -852,7 +873,7 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 			subMu.RLock()
 			sub, exists := subs[header.GetSubject()]
 			if exists {
-				for _, subscriber := range sub.Subscribers {
+				for _, subscriber := range sub.SnapshotSubscribers() {
 					if subscriber.Mrn != agent.Mrn {
 						if err = subscriber.QueueMessage(mmtpMessage); err != nil {
 							log.Error("Could not queue message to agent:", err)
@@ -871,13 +892,14 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 					Response:       mmtp.ResponseEnum_GOOD,
 				}},
 		}
+		log.Debugf("Sending message %v", resp)
 		if err := rw.WriteMessage(request.Context(), c, resp); err != nil {
 			log.Error("Could not send Send OK response:", err)
 		}
 	}
 }
 
-func verifyAgentCertificate() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+func verifyAgentCertificate(skipRevocationCheck bool) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 		// we did not receive a certificate from the client, so we just return early
 		if len(rawCerts) == 0 || len(verifiedChains) == 0 {
@@ -898,6 +920,8 @@ func verifyAgentCertificate() func(rawCerts [][]byte, verifiedChains [][]*x509.C
 			if err != nil {
 				return err
 			}
+		} else if skipRevocationCheck {
+			log.Warn("was not able to check revocation status of client certificate")
 		} else {
 			return fmt.Errorf("was not able to check revocation status of client certificate")
 		}
@@ -916,11 +940,14 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 			response, _, err := rw.ReadMessage(ctx, edgeRouter.routerWs) //Block until receive from socket
 			if err != nil {
 				log.Warn("Could not receive response from MMS Router:", err)
-				edgeRouter.wsMu.Lock()
-				edgeRouter.TryConnectRouter(ctx)
-				edgeRouter.wsMu.Unlock()
+				if !errors.Is(err, context.Canceled) {
+					edgeRouter.wsMu.Lock()
+					edgeRouter.TryConnectRouter(ctx)
+					edgeRouter.wsMu.Unlock()
+				}
 				continue
 			}
+			log.Debugf("Handling received message %v", response.GetBody())
 
 			if _, err := uuid.Parse(response.GetUuid()); err != nil {
 				// message UUID is invalid, so we discard it
@@ -974,12 +1001,17 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 						case *mmtp.ApplicationMessageHeader_Subject:
 							{
 								edgeRouter.subMu.RLock()
-								for _, subscriber := range edgeRouter.subscriptions[subjectOrRecipient.Subject].Subscribers {
+								subscription := edgeRouter.subscriptions[subjectOrRecipient.Subject]
+								var subscribers []*Agent
+								if subscription != nil {
+									subscribers = subscription.SnapshotSubscribers()
+								}
+								edgeRouter.subMu.RUnlock()
+								for _, subscriber := range subscribers {
 									if err = subscriber.QueueMessage(incomingMessage); err != nil {
 										log.Error("Could not queue message:", err)
 									}
 								}
-								edgeRouter.subMu.RUnlock()
 							}
 						case *mmtp.ApplicationMessageHeader_Recipients:
 							{
@@ -1032,6 +1064,7 @@ func handleOutgoingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 		default:
 
 			for outgoingMessage := range edgeRouter.outgoingChannel {
+				log.Debugf("Attempting to send message %v", outgoingMessage)
 				switch outgoingMessage.GetMsgType() {
 				case mmtp.MsgType_PROTOCOL_MESSAGE:
 					{
@@ -1134,24 +1167,25 @@ func recordMetrics(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Regi
 	}
 }
 
-func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry) {
+func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry, port int) {
 	defer wg.Done()
 
 	// Start the Prometheus metrics server
+	addr := ":" + strconv.Itoa(port)
 	server := &http.Server{
-		Addr:    ":2112",
+		Addr:    addr,
 		Handler: http.DefaultServeMux,
 	}
 
+	log.Infof("Start prometheus server on port %d", port)
+
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Errorf("ListenAndServe(): %s", err)
 		}
-	}()
+	})
 
 	// Listen for context cancellation to gracefully shutdown the server
 	<-ctx.Done()
@@ -1162,26 +1196,91 @@ func runPrometheusMetricsServer(ctx context.Context, wg *sync.WaitGroup, reg *pr
 	}
 }
 
+func runHealthServer(ctx context.Context, wg *sync.WaitGroup, port int) {
+	defer wg.Done()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"healthy"}`)); err != nil {
+			log.Errorf("Could not write health response: %s", err)
+		}
+	})
+
+	addr := ":" + strconv.Itoa(port)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+	log.Infof("Health server listening on port %d", port)
+
+	wg.Go(func() {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Errorf("Health server ListenAndServe(): %s", err)
+		}
+	})
+
+	<-ctx.Done()
+	log.Warn("Shutting down health server...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("Health server shutdown: %s", err)
+	}
+}
+
 func main() {
+	os.Exit(runMain(os.Args[1:]))
+}
+
+func runMain(args []string) int {
+	if err := run(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		log.Error(err)
+		return 1
+	}
+
+	return 0
+}
+
+func run(args []string) error {
+	return runWithStderr(args, os.Stderr)
+}
+
+func runWithStderr(args []string, stderr io.Writer) error {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// wait for a SIGINT or SIGTERM signal
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(ch)
 
-	routerAddr := flag.String("raddr", "ws://localhost:8080", "The websocket URL of the Router to connect to.")
-	listeningPort := flag.Int("port", 8888, "The port number that this Edge Router should listen on.")
-	ownMrn := flag.String("mrn", "urn:mrn:mcp:device:idp1:org1:er", "The MRN of this Edge Router")
-	clientCertPath := flag.String("client-cert", "", "Path to a client certificate which will be used to authenticate towards Router. If none is provided, mutual TLS will be disabled.")
-	clientCertKeyPath := flag.String("client-cert-key", "", "Path to a client certificate private key which will be used to authenticate towards Router. If none is provided, mutual TLS will be disabled.")
-	certPath := flag.String("cert-path", "", "Path to a TLS certificate file. If none is provided, TLS will be disabled.")
-	certKeyPath := flag.String("cert-key-path", "", "Path to a TLS certificate private key. If none is provided, TLS will be disabled.")
-	clientCAs := flag.String("client-ca", "", "Path to a file containing a list of client CAs that can connect to this Edge Router.")
-	debug := flag.Bool("d", false, "Indicates whether debugging should be enabled, false by default")
-	geoLoc := flag.String("l", "", "Lookup code indicating the geo location of the running instance")
-	insecure := flag.Bool("i", false, "Allow insecure TLS (No validation of certificate CA)")
+	flagSet := flag.NewFlagSet("edgerouter", flag.ContinueOnError)
+	flagSet.SetOutput(stderr)
+	routerAddr := flagSet.String("raddr", "ws://localhost:8080", "The websocket URL of the Router to connect to.")
+	listeningPort := flagSet.Int("port", 8888, "The port number that this Edge Router should listen on.")
+	ownMrn := flagSet.String("mrn", "urn:mrn:mcp:device:idp1:org1:er", "The MRN of this Edge Router")
+	clientCertPath := flagSet.String("client-cert", "", "Path to a client certificate which will be used to authenticate towards Router. If none is provided, mutual TLS will be disabled.")
+	clientCertKeyPath := flagSet.String("client-cert-key", "", "Path to a client certificate private key which will be used to authenticate towards Router. If none is provided, mutual TLS will be disabled.")
+	certPath := flagSet.String("cert-path", "", "Path to a TLS certificate file. If none is provided, TLS will be disabled.")
+	certKeyPath := flagSet.String("cert-key-path", "", "Path to a TLS certificate private key. If none is provided, TLS will be disabled.")
+	clientCAs := flagSet.String("client-ca", "", "Path to a file containing a list of client CAs that can connect to this Edge Router.")
+	tlsCAs := flagSet.String("tlsca", "", "Path to a file containing trusted TLS CA certificates.")
+	debug := flagSet.Bool("d", false, "Indicates whether debugging should be enabled, false by default")
+	geoLoc := flagSet.String("l", "", "Lookup code indicating the geo location of the running instance")
+	insecure := flagSet.Bool("i", false, "Allow insecure TLS (No validation of certificate CA)")
+	prometheusPort := flagSet.Int("prometheus-port", 2112, "The port number for the Prometheus metrics server.")
+	healthPort := flagSet.Int("health-port", 8889, "The port number for the plaintext health check server.")
+	skipRevocationCheck := flagSet.Bool("skip-revocation-check", false, "Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.")
 
-	flag.Parse()
+	if err := flagSet.Parse(args); err != nil {
+		return err
+	}
 	if *debug {
 		log.SetLevel(log.DebugLevel)
 		log.Info("Operating in Debug mode")
@@ -1195,24 +1294,34 @@ func main() {
 
 	if *clientCertPath != "" && *clientCertKeyPath != "" {
 		clientCertFunc = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			cert, err := tls.LoadX509KeyPair(*clientCertPath, *clientCertKeyPath)
+			certificate, err := tls.LoadX509KeyPair(*clientCertPath, *clientCertKeyPath)
 			if err != nil {
 				log.Error("Could not read the provided client certificate:", err)
 				return nil, err
 			}
-			parsedCert, err := x509.ParseCertificate(cert.Certificate[0])
+			parsedCert, err := x509.ParseCertificate(certificate.Certificate[0])
 			if err != nil {
 				log.Error("Could not parse the provided client certificate:", err)
+			} else {
 				*ownMrn = auth.GetMrnFromCertificate(parsedCert)
 			}
-			return &cert, nil
+			return &certificate, nil
 		}
+	}
+
+	certPool, err := cert.LoadCertPool(*tlsCAs)
+	if err != nil {
+		return fmt.Errorf("could not load configured TLS CAs: %w", err)
+	}
+	if certPool == nil {
+		log.Info("No TLS CA configured, using system CA store")
 	}
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				GetClientCertificate: clientCertFunc,
+				RootCAs:              certPool,
 			},
 		},
 	}
@@ -1223,7 +1332,7 @@ func main() {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 
-	routerWs, _, err := websocket.Dial(ctx, *routerAddr, &websocket.DialOptions{HTTPClient: httpClient, CompressionMode: websocket.CompressionContextTakeover})
+	routerWs, _, err := websocket.Dial(context.Background(), *routerAddr, &websocket.DialOptions{HTTPClient: httpClient, CompressionMode: websocket.CompressionContextTakeover})
 	if err != nil {
 		log.Warn("Could not connect to MMS Router")
 		log.Warn("Starting EdgeRouter without connection to Router")
@@ -1234,10 +1343,9 @@ func main() {
 
 	wg := &sync.WaitGroup{}
 
-	er, err := NewEdgeRouter(":"+strconv.Itoa(*listeningPort), *ownMrn, outgoingChannel, routerWs, ctx, wg, clientCAs, routerAddr, httpClient, *geoLoc)
+	er, err := NewEdgeRouter(":"+strconv.Itoa(*listeningPort), ownMrn, outgoingChannel, routerWs, ctx, wg, clientCAs, routerAddr, httpClient, *geoLoc, *skipRevocationCheck)
 	if err != nil {
-		log.Error("Could not create MMS Edge Router instance:", err)
-		return
+		return fmt.Errorf("could not create MMS Edge Router instance: %w", err)
 	}
 
 	wg.Add(1)
@@ -1247,17 +1355,26 @@ func main() {
 	wg.Add(2)
 	reg := prometheus.NewRegistry()
 	go recordMetrics(ctx, wg, reg, er)
-	go runPrometheusMetricsServer(ctx, wg, reg)
+	go runPrometheusMetricsServer(ctx, wg, reg, *prometheusPort)
+
+	wg.Add(1)
+	go runHealthServer(ctx, wg, *healthPort)
 
 	mdnsServer, err := zeroconf.Register("MMS Edge Router", "_mms-edgerouter._tcp", "local.", *listeningPort, nil, nil)
 	if err != nil {
 		log.Error("Could not create mDNS service, shutting down", err)
-		ch <- os.Interrupt
+		// Queue shutdown, but don't block in case the channel is full.
+		select {
+		case ch <- os.Interrupt:
+		default:
+		}
+	} else {
+		defer mdnsServer.Shutdown()
 	}
-	defer mdnsServer.Shutdown()
 
 	<-ch
 	log.Warn("Received signal, shutting down...")
 	cancel()
 	wg.Wait()
+	return nil
 }
