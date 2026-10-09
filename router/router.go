@@ -1090,7 +1090,7 @@ func main() {
 	certKeyPath := flag.String("cert-key-path", "", "Path to a TLS certificate private key. If none is provided, TLS will be disabled.")
 	clientCAs := flag.String("client-ca", "", "Path to a file containing a list of client CAs that can connect to this Router.")
 	debug := flag.Bool("d", false, "Indicates whether debugging should be enabled, false by default")
-	beacons := flag.String("beacons", "beacons.txt", "Path to a file containing beacons, who this router can use to connect to the libp2p network.")
+	beacons := flag.String("beacons", "/conf/beacons.txt", "Path to a file containing beacons, who this router can use to connect to the libp2p network.")
 	geoLoc := flag.String("l", "DNK", "Lookup code indicating the geo location of the running instance")
 	prometheusPort := flag.Int("prometheus-port", 2113, "The port number for the Prometheus metrics server.")
 	healthPort := flag.Int("health-port", 8081, "The port number for the plaintext health check server.")
